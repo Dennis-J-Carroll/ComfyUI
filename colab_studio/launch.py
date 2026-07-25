@@ -40,10 +40,13 @@ def start_tunnel(port: int, log_path: str, timeout: float = 40.0,
     if os.path.exists(log_path):
         os.remove(log_path)
     log = open(log_path, "wb")
-    proc = subprocess.Popen(
-        [CLOUDFLARED, "tunnel", "--url", f"http://127.0.0.1:{port}"],
-        stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            [CLOUDFLARED, "tunnel", "--url", f"http://127.0.0.1:{port}"],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    except FileNotFoundError:
+        return None
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() not in (None,):
@@ -56,6 +59,7 @@ def start_tunnel(port: int, log_path: str, timeout: float = 40.0,
         except FileNotFoundError:
             pass
         time.sleep(interval)
+    proc.terminate()
     return None
 
 

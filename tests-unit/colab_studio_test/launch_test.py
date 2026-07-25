@@ -1,8 +1,5 @@
-import os
 import sys
 import time
-
-import pytest
 
 from colab_studio import launch
 
@@ -81,8 +78,32 @@ def test_start_tunnel_returns_none_on_timeout(tmp_path, monkeypatch):
     log.write_text("INF starting...\n")
 
     class P:
+        def __init__(self):
+            self.terminated = False
+
         def poll(self):
             return None
 
-    monkeypatch.setattr(launch.subprocess, "Popen", lambda cmd, **kw: P())
+        def terminate(self):
+            self.terminated = True
+
+    procs = []
+
+    def fake_popen(cmd, **kwargs):
+        p = P()
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(launch.subprocess, "Popen", fake_popen)
+    assert launch.start_tunnel(8188, str(log), timeout=2) is None
+    assert procs[0].terminated is True
+
+
+def test_start_tunnel_returns_none_when_cloudflared_missing(tmp_path, monkeypatch):
+    log = tmp_path / "cf.log"
+
+    def fake_popen(cmd, **kwargs):
+        raise FileNotFoundError("no such file: cloudflared")
+
+    monkeypatch.setattr(launch.subprocess, "Popen", fake_popen)
     assert launch.start_tunnel(8188, str(log), timeout=2) is None
