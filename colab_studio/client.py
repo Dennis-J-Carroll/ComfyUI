@@ -31,6 +31,10 @@ class ComfyClient:
                 r = requests.get(f"{self.base_url}/system_stats", timeout=5)
                 if r.status_code == 200:
                     return True
+            except (requests.exceptions.MissingSchema,
+                    requests.exceptions.InvalidSchema,
+                    requests.exceptions.InvalidURL) as err:
+                raise ComfyError(f"invalid base_url {self.base_url!r}: {err}") from err
             except requests.RequestException:
                 pass
             time.sleep(interval)

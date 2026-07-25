@@ -87,6 +87,11 @@ def test_wait_ready_false_when_never_ready(server):
     assert ComfyClient(url).wait_ready(timeout=1.5) is False
 
 
+def test_wait_ready_raises_promptly_on_schemeless_base_url():
+    with pytest.raises(ComfyError):
+        ComfyClient("127.0.0.1:9").wait_ready(timeout=2.0)
+
+
 def test_submit_returns_prompt_id(server):
     url, _ = server
     assert ComfyClient(url).submit({"1": {"class_type": "X", "inputs": {}}}) == "pid-123"
