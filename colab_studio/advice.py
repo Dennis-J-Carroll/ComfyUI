@@ -47,6 +47,8 @@ def recommend(vram_gb: float, disk_free_gb: float = 100.0) -> Advice:
         flags = ["--highvram"]
         notes.append("Enough VRAM for Flux dev fp8 and SDXL at 1024px.")
 
+    # Disk guard: if model won't fit, downgrade profile but keep tier/flags.
+    # Tier and launch_flags reflect available VRAM; profile reflects what will fit on disk.
     if profile.startswith("flux") and disk_free_gb < FLUX_DISK_GB + DISK_HEADROOM_GB:
         notes.append(
             f"Only {disk_free_gb:.0f} GB disk free; Flux needs "

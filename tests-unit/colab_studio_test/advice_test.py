@@ -37,11 +37,27 @@ def test_recommended_profile_always_exists_in_registry():
         assert recommend(vram).profile in PROFILES
 
 
+def test_boundary_12_0_is_mid_tier():
+    # Exactly 12.0 GB should be "mid" (just reaching MID threshold).
+    a = recommend(12.0)
+    assert a.tier == "mid"
+
+
+def test_boundary_20_0_is_high_tier():
+    # Exactly 20.0 GB should be "high" and get --highvram (just reaching high threshold).
+    a = recommend(20.0)
+    assert a.tier == "high"
+    assert "--highvram" in a.launch_flags
+
+
 def test_low_disk_forces_small_profile_even_on_big_gpu():
     # Flux is 16 GB; refusing it when disk is tight prevents a mid-download death.
     a = recommend(40.0, disk_free_gb=12.0)
     assert a.profile == "sdxl"
     assert any("disk" in n.lower() for n in a.notes)
+    # Tier and launch_flags describe available hardware; profile describes what fits on disk.
+    assert a.tier == "high"
+    assert "--highvram" in a.launch_flags
 
 
 def test_advice_is_frozen():
