@@ -7,7 +7,7 @@ doubling disk use -- fatal for a 16 GB checkpoint on a Colab VM.
 from __future__ import annotations
 
 import os
-import shutil
+import shutil  # noqa: F401 -- referenced only via monkeypatch in fetch_test.py
 from typing import Callable
 
 from huggingface_hub import hf_hub_download
