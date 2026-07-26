@@ -1,13 +1,41 @@
 """Tests ComfyClient against a real stub HTTP server on a loopback socket."""
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
 from colab_studio.client import ComfyClient, ComfyError
 
-STATE = {"ready": True, "history_hits": 0, "history_ready_after": 0}
+STATE = {"ready": True, "history_hits": 0, "history_ready_after": 0,
+         "history_error": False}
+
+# What ComfyUI actually puts in /history when a node blows up at runtime:
+# outputs stays empty forever, so only `status` reveals the failure.
+ERROR_HISTORY = {
+    "outputs": {},
+    "status": {
+        "status_str": "error",
+        "completed": False,
+        "messages": [
+            ["execution_start", {"prompt_id": "pid-123"}],
+            ["execution_error", {
+                "node_id": "5",
+                "node_type": "KSampler",
+                "exception_type": "torch.cuda.OutOfMemoryError",
+                "exception_message": "CUDA out of memory. Tried to allocate 2 GiB",
+            }],
+        ],
+    },
+}
+
+# In-flight: completed is False but status_str is not "error". Treating this
+# as a failure would abort every generate on the first poll.
+RUNNING_HISTORY = {
+    "outputs": {},
+    "status": {"status_str": "success", "completed": False, "messages": []},
+}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -30,13 +58,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"system": {"comfyui_version": "0.10.0"}})
         elif self.path.startswith("/history/"):
             STATE["history_hits"] += 1
-            if STATE["history_hits"] <= STATE["history_ready_after"]:
-                self._json(200, {})
+            pid = self.path.rsplit("/", 1)[-1]
+            if STATE["history_error"]:
+                self._json(200, {pid: ERROR_HISTORY})
+            elif STATE["history_hits"] <= STATE["history_ready_after"]:
+                self._json(200, {pid: RUNNING_HISTORY})
             else:
-                pid = self.path.rsplit("/", 1)[-1]
                 self._json(200, {pid: {"outputs": {"7": {"images": [
                     {"filename": "out_001.png", "subfolder": "colab", "type": "output"}
-                ]}}}})
+                ]}}, "status": {"status_str": "success", "completed": True,
+                                "messages": []}}})
         elif self.path.startswith("/view"):
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
@@ -68,7 +99,8 @@ class Handler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def server():
-    STATE.update({"ready": True, "history_hits": 0, "history_ready_after": 0})
+    STATE.update({"ready": True, "history_hits": 0, "history_ready_after": 0,
+                  "history_error": False})
     httpd = HTTPServer(("127.0.0.1", 0), Handler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
@@ -110,6 +142,38 @@ def test_wait_result_polls_until_outputs_appear(server):
     refs = ComfyClient(url).wait_result("pid-123", timeout=10)
     assert refs[0]["filename"] == "out_001.png"
     assert state["history_hits"] > 2
+
+
+def test_wait_result_raises_promptly_on_execution_error(server):
+    """A runtime failure (OOM, tensor mismatch) leaves outputs empty forever.
+    Without reading status, the user waits the full 10 minutes and then gets a
+    diagnostic-free TimeoutError."""
+    url, state = server
+    state["history_error"] = True
+    t0 = time.time()
+    with pytest.raises(ComfyError) as exc:
+        ComfyClient(url).wait_result("pid-123", timeout=30.0)
+    assert time.time() - t0 < 10.0, "must fail fast, not wait out the timeout"
+    msg = str(exc.value)
+    assert "OutOfMemoryError" in msg          # the server's exception_type
+    assert "CUDA out of memory" in msg        # the server's exception_message
+    assert "KSampler" in msg                  # which node died
+
+
+def test_wait_result_does_not_mistake_an_in_flight_job_for_a_failure(server):
+    """`completed: False` is normal while running; only status_str=="error"
+    is a failure."""
+    url, state = server
+    state["history_ready_after"] = 2
+    assert ComfyClient(url).wait_result("pid-123", timeout=10)
+
+
+def test_generate_surfaces_execution_errors(server):
+    url, state = server
+    state["history_error"] = True
+    with pytest.raises(ComfyError):
+        ComfyClient(url).generate({"1": {"class_type": "X", "inputs": {}}},
+                                  timeout=30.0)
 
 
 def test_wait_result_times_out(server):
