@@ -5,14 +5,18 @@ import re
 
 import pytest
 
-NB = "ComfyUI_Colab_Studio.ipynb"
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+NB = os.path.join(REPO, "ComfyUI_Colab_Studio.ipynb")
 
 
 @pytest.fixture(scope="module")
 def blob():
+    """Resolved from __file__, so a different cwd cannot silently skip the
+    whole acceptance gate. Missing notebook is a failure, not a skip."""
     if not os.path.exists(NB):
-        pytest.skip("run build_notebook.py first")
-    return json.dumps(json.load(open(NB)))
+        pytest.fail(f"{NB} missing -- run: python build_notebook.py")
+    with open(NB) as fh:
+        return json.dumps(json.load(fh))
 
 
 def test_no_mcp_reference(blob):
