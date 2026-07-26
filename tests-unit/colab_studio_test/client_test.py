@@ -1,12 +1,32 @@
 """Tests ComfyClient against a real stub HTTP server on a loopback socket."""
+import contextlib
+import copy
+import io
 import json
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from colab_studio.client import ComfyClient, ComfyError
+from colab_studio.client import ComfyClient, ComfyError, _execution_error
+
+
+@pytest.fixture(scope="module")
+def comfy_execution():
+    """ComfyUI's execution module, for asserting against its real types.
+
+    comfy.options.enable_args_parsing() MUST precede the import, and
+    model_management probes the device at import time -- hence --cpu.
+    """
+    sys.argv = ["main.py", "--cpu"]
+    import comfy.options
+    comfy.options.enable_args_parsing()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        import execution
+    return execution
 
 STATE = {"ready": True, "history_hits": 0, "history_ready_after": 0,
          "history_error": False}
@@ -174,6 +194,57 @@ def test_generate_surfaces_execution_errors(server):
     with pytest.raises(ComfyError):
         ComfyClient(url).generate({"1": {"class_type": "X", "inputs": {}}},
                                   timeout=30.0)
+
+
+def test_error_parser_matches_comfyui_own_execution_status(comfy_execution):
+    """Binds _execution_error to ComfyUI's real type, not to our stub.
+
+    ERROR_HISTORY above is hand-written; if it drifted from what the server
+    actually sends, every error test would still pass while the fix silently
+    never fired. This builds a genuine PromptQueue.ExecutionStatus, mirrors
+    what execution.py's task_done() stores (_asdict into the history entry),
+    round-trips it through JSON exactly as the HTTP layer does, and asserts we
+    extract the detail.
+
+    Contract (execution.py:1140, main.py:237):
+      status_str='success'|'error'; completed=e.success (so False on error --
+      which is why only status_str may be used as the error signal);
+      messages=[(event, data), ...]; execution_error data carries
+      node_id/node_type/exception_type/exception_message.
+    """
+    status = comfy_execution.PromptQueue.ExecutionStatus(
+        status_str="error",
+        completed=False,
+        messages=[("execution_start", {"prompt_id": "pid-123"}),
+                  ("execution_error", {
+                      "prompt_id": "pid-123", "node_id": "5",
+                      "node_type": "KSampler",
+                      "exception_type": "torch.cuda.OutOfMemoryError",
+                      "exception_message": "CUDA out of memory",
+                      "traceback": [], "executed": []})],
+    )
+    hist = json.loads(json.dumps(
+        {"prompt": [], "outputs": {}, "status": copy.deepcopy(status._asdict())}))
+
+    detail = _execution_error(hist)
+    assert detail is not None, "real ExecutionStatus not recognised as an error"
+    assert "torch.cuda.OutOfMemoryError" in detail
+    assert "CUDA out of memory" in detail
+    assert "KSampler" in detail
+
+    # And the success shape must NOT look like an error.
+    ok = comfy_execution.PromptQueue.ExecutionStatus(
+        status_str="success", completed=True, messages=[])
+    assert _execution_error(
+        json.loads(json.dumps({"status": copy.deepcopy(ok._asdict())}))) is None
+
+
+def test_error_parser_tolerates_a_missing_or_null_status():
+    """task_done() stores status=None when it is given none (execution.py:1152),
+    and an in-flight entry has no status yet. Neither may raise."""
+    assert _execution_error({}) is None
+    assert _execution_error({"status": None}) is None
+    assert _execution_error({"status": {}}) is None
 
 
 def test_wait_result_times_out(server):
