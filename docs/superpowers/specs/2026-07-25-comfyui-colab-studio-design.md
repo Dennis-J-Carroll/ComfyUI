@@ -2,7 +2,9 @@
 
 **Date:** 2026-07-25
 **Status:** Approved for planning
-**Goal:** A single Colab notebook that runs image (and optionally video) workflows end to end, with enough in-notebook guidance that the user never has to leave Colab to look something up.
+**Goal:** A single Colab notebook that runs image workflows end to end, with enough in-notebook guidance that the user never has to leave Colab to look something up.
+
+> **Amended 2026-07-25 (final review).** Two claims in the original design were cut rather than built: ComfyUI-sidebar (UI-format) workflows, and `MODE=video`. Both are marked inline below. Video remains `Wan2.2_Colab_Pipeline.ipynb`'s job.
 
 ---
 
@@ -41,17 +43,19 @@ Both paths are independent of `colab-mcp`.
 | # | Cell | Purpose |
 |---|------|---------|
 | 0 | MD | TL;DR — which cells to run, what each does |
-| 1 | **Config** | `MODE` (image/video), `IMAGE_MODEL`, `VIDEO_MODEL`, `PERSIST`, `CONTROLNET` — Colab form dropdowns |
+| 1 | **Config** | `IMAGE_MODEL`, `PERSIST`, `CONTROLNET`, `USE_UPSCALER` — Colab form dropdowns. **Amended:** no `MODE`/`VIDEO_MODEL` — video was cut (criterion 6) |
 | 2 | **Preflight + advice** | Detect GPU name/VRAM/disk; print what fits and expected sec/image; **set** `LAUNCH_FLAGS` |
-| 3 | **Install** | Clone ComfyUI, pip deps; Wan/GGUF/VHS custom nodes only when `MODE=video` |
+| 3 | **Install** | Clone ComfyUI, pip deps. **Amended:** core ComfyUI only — no custom-node clones, since video was cut |
 | 4 | **Persistence** | Drive: symlink `output/` + `user/` only. Models stay on VM disk (see below) |
-| 5 | **Download** | Registry-driven fetcher |
-| 6 | **Write workflows** | UI-format → `user/default/workflows/`; API-format → `/content/wf_api/` |
+| — | **Library** | Six `%%writefile` cells inline `colab_studio/*.py`; no uploads, no clone of this repo |
+| 5 | **Download** | Registry-driven fetcher. Re-measures free space **at the models/ destination**, which is a Drive symlink under `PERSIST="everything"` |
+| 6 | **Write workflows** | **Amended:** API-format → `/content/wf_api/` only. UI-format/sidebar was dropped (criterion 5) |
 | 7 | **Launch (backgrounded)** | `Popen` → poll `/system_stats` → *then* tunnel → print URL |
 | 8 | **Generate inline** | Form fields → patch API graph → `POST /prompt` → poll → display image in notebook |
+| 8b | **img2img / ControlNet** | Upload or URL → `POST /upload/image` → graph → display. Gated behind `run_this` (default off) so the blocking file picker cannot stall **Run all** |
 | 9 | **Log tail** | Last N lines of server log; rerunnable |
-| 10 | **Ops** | Restart server, `POST /free`, re-tunnel, list models, disk usage |
-| 11 | MD | **Colab handbook** — model/VRAM/speed table, sampler+steps+cfg per model, error→fix table, session/disk/quota quirks, adding LoRAs |
+| 10 | **Ops** | Restart server, `POST /free`, re-tunnel (stops the old one first), list models, disk usage |
+| — | MD | **Colab handbook** — model/VRAM/speed table, sampler+steps+cfg per model, error→fix table, session/disk/quota quirks, adding LoRAs |
 
 ### Load-bearing decisions
 
@@ -63,7 +67,13 @@ Both paths are independent of `colab-mcp`.
 
 **Registry-driven fetcher.** `comfy_fetch.py` replaces `download_models.py`: a dict of `model_id → [(repo, filename, dest_folder, dest_filename)]`. Uses `hf_hub_download(local_dir=...)` (no double-write), drops deprecated `resume_download`, skips files already present, prints sizes before downloading.
 
-**Two workflow formats, both hand-authored.** UI-format for the ComfyUI sidebar (`user/default/workflows/`, served by `/userdata/{file}`), API-format for cell 8. A UI→API converter is fragile for 7–10 node graphs; duplicating small JSON is dumber and more reliable.
+**~~Two workflow formats, both hand-authored.~~ One format: API only.** *(Amended 2026-07-25 — final review.)*
+
+The original decision was to hand-author UI-format graphs for the ComfyUI sidebar (`user/default/workflows/`, served by `/userdata/{file}`) alongside API-format ones for cell 8. **Only API format is produced.** The inline generate cells (8 and 8b) POST API-format graphs to `/prompt`, so that is the format the notebook's own features consume; the UI writer would have served only the tunnel-tab sidebar. It was never implemented — the shipped cell 6 created `user/default/workflows/` and then wrote nothing into it, so the sidebar claim was false in both the cell title and its printed output.
+
+Rather than build a second hand-authored schema for a convenience feature, the claim was dropped: cell 6 now writes API format to `/content/wf_api/` and says so. In the tunnel UI, graphs are built by hand. **Consequence:** acceptance criterion 5 is withdrawn (see below).
+
+**Profile dispatch lives in one place.** *(Added 2026-07-25 — final review.)* `workflows._spine()` is the single point where the Flux-vs-SDXL sampling contract is applied: Flux forces cfg 1.0 / `euler` / `simple` and wires a `FluxGuidance` node into `KSampler.positive`. Every builder routes through it and takes a `profile` keyword. Previously `upscale`, `img2img` and `controlnet_canny` were SDXL-shaped unconditionally while being handed whatever `CKPT` the profile resolved to — verified by execution: `upscale('flux1-dev-fp8.safetensors', …)` yielded cfg 7.0, `dpmpp_2m`, no `FluxGuidance`, which scorches Flux output. ControlNet is the exception: its weights really are SDXL, so `controlnet_canny()` and `registry.resolve()` raise `ValueError` on a Flux profile instead of silently degrading, and cell 5 disables ControlNet on Flux before the 2.33 GB download starts.
 
 **GPU auto-detect despite a Pro subscription.** Colab reassigns tiers. Cell 2 detects and adapts rather than hardcoding `--highvram`, which is actively wrong on a T4.
 
@@ -78,7 +88,6 @@ All entries HEAD-verified on 2026-07-25.
 | ID | Repo | File | Size | Dest |
 |----|------|------|------|------|
 | `sdxl` | `stabilityai/stable-diffusion-xl-base-1.0` | `sd_xl_base_1.0.safetensors` | 6.46 GB | `models/checkpoints` |
-| `sdxl-vae` | `stabilityai/sdxl-vae` | `sdxl_vae.safetensors` | 0.31 GB | `models/vae` |
 | `flux-dev` | `Comfy-Org/flux1-dev` | `flux1-dev-fp8.safetensors` | 16.06 GB | `models/checkpoints` |
 | `flux-schnell` | `Comfy-Org/flux1-schnell` | `flux1-schnell-fp8.safetensors` | 16.05 GB | `models/checkpoints` |
 | `upscale` | `Kim2091/UltraSharp` | `4x-UltraSharp.pth` | 0.06 GB | `models/upscale_models` |
@@ -89,13 +98,14 @@ All entries HEAD-verified on 2026-07-25.
 - Flux fp8 is **16 GB, not ~11 GB** as commonly assumed.
 - `flux1-dev-fp8.safetensors` is an **all-in-one** (UNet + T5 + CLIP-L + VAE). It loads via `CheckpointLoaderSimple`, giving a 7-node graph instead of the 10-node `UNETLoader`+`DualCLIPLoader`+`VAELoader` split.
 - The ControlNet file is diffusers-layout and must be renamed on download. `comfy/controlnet.py:623` has an explicit diffusers branch (`if "controlnet_cond_embedding.conv_in.weight" in controlnet_data`), so it will load.
-- Flux ControlNet (`flux1-canny-dev`, **22.17 GB**) is ruled out as prohibitive.
+- Flux ControlNet (`flux1-canny-dev`, **22.17 GB**) is ruled out as prohibitive. Because the only ControlNet shipped is SDXL, `resolve()` and `controlnet_canny()` raise on a Flux profile rather than pairing SDXL control weights with a Flux checkpoint.
+- **Amended 2026-07-25 (final review):** the `sdxl-vae` entry (0.31 GB) was **removed**. No builder emits a `VAELoader`; every graph takes its VAE from `CheckpointLoaderSimple` output 2, so the file was downloaded and never opened.
 
 ---
 
 ## Workflows
 
-Five graphs, all validated (see Testing).
+Five graphs, all validated (see Testing). All are API format — see "One format: API only" above. Each is emitted through `workflows._spine()`, so a Flux profile always gets cfg 1.0 + `FluxGuidance` and an SDXL profile always gets `dpmpp_2m`/`karras`.
 
 **Core (always):**
 - `sdxl_txt2img` — 7 nodes. `dpmpp_2m` / `karras`, 25 steps, cfg 7.0, 1024×1024.
@@ -182,12 +192,12 @@ Registered in user-scope MCP config on 2026-07-25, verified `✔ Connected`:
 
 ## Acceptance criteria
 
-1. Fresh Colab, `MODE=image`, Run All → tunnel URL prints and resolves without a 502.
-2. Cells 8–10 are reachable and rerunnable after launch.
+1. Fresh Colab, Run All → tunnel URL prints and resolves without a 502.
+2. Cells 8–10 are reachable and rerunnable after launch. **Run All must reach them**: no cell may block on interactive input, which is why cell 8b's file picker sits behind `run_this` (default off).
 3. Cell 8 produces an image displayed inline, without opening the tunnel.
 4. Cell 2 prints GPU-appropriate advice and sets launch flags that differ between T4 and L4/A100.
-5. All five workflows appear in the ComfyUI sidebar.
-6. `MODE=video` reproduces current Wan 2.2 behavior.
+5. ~~All five workflows appear in the ComfyUI sidebar.~~ **WITHDRAWN 2026-07-25 (final review).** Sidebar workflows require UI format, which was never built; see "One format: API only" above. Replacement criterion: **cell 6 writes an API-format JSON per available workflow into `/content/wf_api/`, each one profile-correct for the resolved `PROFILE`.**
+6. ~~`MODE=video` reproduces current Wan 2.2 behavior.~~ **WITHDRAWN 2026-07-25 (final review).** Video is out of scope for this notebook. `MODE` offered a video option that cloned WanVideoWrapper, ComfyUI-GGUF and VideoHelperSuite — minutes of install and disk — while nothing downstream was video-aware, so it generated SDXL images regardless. The option is removed. **`Wan2.2_Colab_Pipeline.ipynb` remains the video path** and is left untouched.
 7. Second session with `PERSIST` on reuses Drive outputs without re-downloading.
 8. **Independence check.** With `colab-mcp` stopped and no local agent attached, a cold Colab session opened straight from Drive or a GitHub raw URL still satisfies criteria 1–7. `grep -ri "mcp\|colab-mcp" ComfyUI_Colab_Studio.ipynb` returns nothing.
 
@@ -196,3 +206,5 @@ Registered in user-scope MCP config on 2026-07-25, verified `✔ Connected`:
 ## Out of scope
 
 LoRA loading UI, IP-Adapter, inpainting, Flux ControlNet, video upscaling, multi-GPU, custom node management beyond the fixed set.
+
+**Added 2026-07-25 (final review):** UI-format / ComfyUI-sidebar workflows, and video generation of any kind — see the withdrawn criteria 5 and 6.
