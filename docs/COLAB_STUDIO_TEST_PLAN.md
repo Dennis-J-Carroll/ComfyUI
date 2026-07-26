@@ -34,11 +34,17 @@ If something below fails, that's the test doing its job. Record it rather than w
 
 ## Phase 0 — Get the notebook into Colab (5 min)
 
-The notebook isn't in your Drive yet — I didn't upload anything without asking.
+**Option A — open straight from GitHub (fastest, no upload).** The branch is pushed to your fork, so Colab can open it directly:
 
-**Option A — I upload it to your Drive.** Say the word and I'll push it via the Google Drive MCP and hand you the Colab link. No filesystem step for you.
+```
+https://colab.research.google.com/github/Dennis-J-Carroll/ComfyUI/blob/feat/colab-studio/ComfyUI_Colab_Studio.ipynb
+```
 
-**Option B — you upload manually.** File is at `/home/dennisjcarroll/Desktop/ComfyUI/ComfyUI_Colab_Studio.ipynb`. In Colab: File → Upload notebook.
+Colab opens it read-only from the branch; use *File → Save a copy in Drive* if you want to keep your edits. PR for review: https://github.com/Dennis-J-Carroll/ComfyUI/pull/1
+
+**Option B — I push it to your Drive.** Say the word and I'll upload via the Google Drive MCP and hand you the link. Nothing has gone into your Drive so far.
+
+**Option C — upload manually.** File is at `/home/dennisjcarroll/Desktop/ComfyUI/ComfyUI_Colab_Studio.ipynb`. In Colab: File → Upload notebook.
 
 **Then, before running anything:** Runtime → Change runtime type → **GPU**. Colab defaults to CPU. Cell 2 will tell you if you forgot, but you'll have wasted the install.
 
@@ -172,7 +178,11 @@ These exist because cell 13 no longer blocks. Verify each is reachable:
 | 17 | `restart server` | `restarted: True` |
 | 17 | `re-tunnel` | A fresh `trycloudflare.com` URL |
 
-**Deliberately break it:** run `restart server`, then immediately run cell 14 before the server finishes booting. It should either wait or raise a clear `ComfyError` — not hang forever or print something misleading.
+**Deliberately break it — two failure paths worth exercising, because both were bugs the review caught:**
+
+1. **Restart race.** Run `restart server`, then immediately run cell 14 before boot finishes. It should wait, or raise a clear `ComfyError` — not hang, not mislead.
+2. **Execution error surfaces fast.** Force an OOM: set `width=height=2048` in cell 14 on a small GPU. You should get a **`ComfyError` naming the failing node within seconds**. If instead it sits silent for ten minutes and then raises a bare `TimeoutError`, that's the pre-fix behaviour and a regression — `wait_result` is supposed to read the history `status` field now.
+3. **Re-tunnel doesn't leak.** Run `re-tunnel` twice. Each run should print a fresh URL and the previous tunnel should be stopped, not left running. If old `trycloudflare.com` URLs keep working after a re-tunnel, the previous process was orphaned.
 
 ---
 
@@ -198,9 +208,46 @@ Runtime → Disconnect and delete runtime. Reopen the notebook. Run all.
 
 ---
 
+## Scorecard — copy this block, fill it, paste it back
+
+```
+HARDWARE
+  GPU name .................
+  VRAM (GB) ................
+  Free disk (GB) ...........
+
+E4 CALIBRATION  (cell 5 output)
+  tier= ....................
+  profile= .................
+  max_side= ................
+  launch flags= ............
+  Does this match what you know works on this GPU?  yes / no / notes:
+
+STRUCTURAL  (the things this rewrite exists to fix)
+  Cell 13 returned control, did not block ........ pass / fail
+  Tunnel URL loaded, no 502 ...................... pass / fail
+  Cell 14 rendered an image inline ............... pass / fail
+  Run all reached cell 17 without stalling ....... pass / fail
+  Cells 16/17 reachable and rerunnable ........... pass / fail
+
+EXECUTION CRITERIA
+  E1  Flux loaded via CheckpointLoaderSimple ..... pass / fail / not tested
+  E2  Diffusers ControlNet converted and ran ..... pass / fail / not tested
+  E3  Peak VRAM observed (GB) ....................
+  E4  Thresholds correct for this GPU ............ yes / no
+
+FAILURE-PATH CHECKS
+  OOM raised ComfyError in seconds, not a 10-min hang ... pass / fail
+  re-tunnel stopped the previous tunnel ................. pass / fail
+
+TIMINGS
+  Install + download (min) ........
+  Seconds per image ...............
+```
+
 ## Reporting back
 
-Paste me the filled tables plus, for anything that failed:
+Paste the scorecard plus, for anything that failed:
 1. The cell number
 2. The full traceback
 3. Cell 16's log output
