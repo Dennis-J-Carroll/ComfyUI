@@ -4,9 +4,10 @@ Library modules are read from colab_studio/ and inlined as %%writefile
 cells, so the notebook needs no uploads and no git clone of this repo,
 and the shipped code is exactly the tested code.
 
-This file is excluded from ruff's print rule only because it emits no
-prints -- the generated notebook cells do, and *.ipynb is excluded
-(pyproject.toml:28).
+This file is subject to ruff's print rule like the rest of the repo and
+satisfies it by having no print calls of its own. The `print(` occurrences
+below are inside string literals destined for notebook cells, and *.ipynb
+is excluded from linting (pyproject.toml:28).
 """
 from __future__ import annotations
 
@@ -46,33 +47,39 @@ def build(out_path: str) -> dict:
 Self-contained. Nothing to upload. **Runtime > Run all**, then use the
 generate cell at the bottom or open the tunnel URL.
 
+This notebook does **images**. Video stays in `Wan2.2_Colab_Pipeline.ipynb`.
+
 | Cell | What it does |
 |---|---|
 | 1 | Pick model + persistence options |
-| 2 | Detect GPU, print what fits, choose launch flags |
-| 3-6 | Install ComfyUI, link Drive, download models, write workflows |
+| 2 | Detect GPU and disk |
+| 3 | Install ComfyUI |
+| 4 | Link Drive (optional persistence) |
+| *(6 unnumbered)* | `%%writefile` the helper library into `colab_studio/` |
+| 5 | Choose profile, re-check disk, download models |
+| 6 | Write API workflows for the generate cells |
 | 7 | Start the server **in the background** and open a public URL |
 | 8 | Generate an image without leaving this notebook |
-| 9-10 | Logs, restart, free VRAM, disk usage |
-| 11 | Handbook: model sizes, settings, error fixes |
+| 8b | Image-to-image / ControlNet - **tick `run_this` first**; Run all skips it |
+| 9-10 | Logs, restart, free VRAM, disk usage, re-tunnel |
+| *(last)* | Handbook: model sizes, settings, error fixes |
 """),
 
         _code("""
 #@title 1. Config
-MODE = "image"  #@param ["image", "video"]
 IMAGE_MODEL = "auto"  #@param ["auto", "sdxl", "flux-dev", "flux-schnell"]
 PERSIST = "outputs-only"  #@param ["outputs-only", "everything", "off"]
 CONTROLNET = False  #@param {type:"boolean"}
-UPSCALER = True  #@param {type:"boolean"}
+USE_UPSCALER = True  #@param {type:"boolean"}
 PORT = 8188
 COMFY_DIR = "/content/ComfyUI"
-print(f"mode={MODE} model={IMAGE_MODEL} persist={PERSIST} "
-      f"controlnet={CONTROLNET} upscaler={UPSCALER}")
+print(f"model={IMAGE_MODEL} persist={PERSIST} "
+      f"controlnet={CONTROLNET} upscaler={USE_UPSCALER}")
 """),
 
         _code("""
 #@title 2. Preflight - GPU, disk, and what actually fits
-import shutil, subprocess, torch
+import shutil, torch
 
 if not torch.cuda.is_available():
     print("!! No GPU. Runtime > Change runtime type > GPU, then rerun.")
@@ -81,9 +88,11 @@ else:
     props = torch.cuda.get_device_properties(0)
     GPU_NAME, VRAM_GB = props.name, props.total_memory / 2**30
 
+# Indicative only. Cell 5 re-measures at the real models/ destination, which
+# may be a Drive symlink by then.
 DISK_FREE_GB = shutil.disk_usage("/content").free / 2**30
 print(f"GPU:  {GPU_NAME}  ({VRAM_GB:.1f} GB VRAM)")
-print(f"Disk: {DISK_FREE_GB:.0f} GB free")
+print(f"Disk: {DISK_FREE_GB:.0f} GB free on /content")
 """),
 
         _code("""
@@ -95,19 +104,8 @@ if not os.path.isdir(COMFY_DIR):
 %cd {COMFY_DIR}
 !pip install -q -r requirements.txt
 !pip install -q huggingface_hub torchsde requests
-if MODE == "video":
-    os.makedirs("custom_nodes", exist_ok=True)
-    for url, name in [
-        ("https://github.com/kijai/ComfyUI-WanVideoWrapper.git", "ComfyUI-WanVideoWrapper"),
-        ("https://github.com/city96/ComfyUI-GGUF.git", "ComfyUI-GGUF"),
-        ("https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git", "ComfyUI-VideoHelperSuite"),
-    ]:
-        d = os.path.join("custom_nodes", name)
-        if not os.path.isdir(d):
-            os.system(f"git clone {url} {d}")
-        req = os.path.join(d, "requirements.txt")
-        if os.path.isfile(req):
-            os.system(f"pip install -q -r {req}")
+# Core ComfyUI only: every node these workflows use ships with it, so there
+# are no custom_nodes clones to wait on.
 os.makedirs("colab_studio", exist_ok=True)
 open("colab_studio/__init__.py", "a").close()
 print("ComfyUI installed at", COMFY_DIR)
@@ -149,51 +147,86 @@ else:
     cells += [
         _code("""
 #@title 5. Choose profile and download models
-import sys
+import os, shutil, sys
 sys.path.insert(0, COMFY_DIR)
 from colab_studio.advice import recommend
 from colab_studio.registry import resolve, total_gb, CHECKPOINT_NAME
 from colab_studio.fetch import download_all
 
-ADVICE = recommend(VRAM_GB, DISK_FREE_GB)
+MODELS_DIR = os.path.join(COMFY_DIR, "models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+# Measure the filesystem the checkpoints actually land on. With
+# PERSIST="everything" cell 4 symlinked models/ to Drive, whose free tier is
+# 15 GB -- less than one Flux checkpoint. Cell 2's /content figure would
+# happily approve a download that cannot fit.
+MODELS_FREE_GB = shutil.disk_usage(MODELS_DIR).free / 2**30
+print(f"models/ lands on a filesystem with {MODELS_FREE_GB:.0f} GB free")
+
+ADVICE = recommend(VRAM_GB, MODELS_FREE_GB)
 PROFILE = ADVICE.profile if IMAGE_MODEL == "auto" else IMAGE_MODEL
 LAUNCH_FLAGS = ADVICE.launch_flags
 MAX_SIDE = ADVICE.max_side
+
+if IMAGE_MODEL != "auto" and IMAGE_MODEL != ADVICE.profile:
+    print("!" * 70)
+    print(f"!! OVERRIDE: you picked '{IMAGE_MODEL}', but this runtime was "
+          f"sized for '{ADVICE.profile}'.")
+    print("!! Launch flags and the resolution cap still follow the recommended")
+    print("!! profile, so expect a failed download or an OOM at model load.")
+    for n in ADVICE.notes:
+        print("!!  -", n)
+    print(f"!! Set IMAGE_MODEL='auto' in cell 1 for '{ADVICE.profile}'.")
+    print("!" * 70)
 
 print(f"tier={ADVICE.tier}  profile={PROFILE}  max_side={MAX_SIDE}")
 print(f"launch flags: {' '.join(LAUNCH_FLAGS) or '(none)'}")
 for n in ADVICE.notes:
     print(" -", n)
 
-SPECS = resolve(PROFILE, controlnet=CONTROLNET, upscale=UPSCALER)
+# The canny weights are SDXL. On a Flux profile they are 2.33 GB that no
+# workflow can use, so drop them rather than download them. Every cell below
+# reads USE_CONTROLNET, not the raw form field.
+USE_CONTROLNET = CONTROLNET
+if USE_CONTROLNET and PROFILE.startswith("flux"):
+    print(f"!! ControlNet is SDXL-only; disabled for profile '{PROFILE}'. "
+          "Skipping a 2.33 GB unusable download.")
+    USE_CONTROLNET = False
+
+SPECS = resolve(PROFILE, controlnet=USE_CONTROLNET, upscale=USE_UPSCALER)
 print(f"\\nDownloading {len(SPECS)} files, {total_gb(SPECS)} GB total")
-download_all(SPECS, os.path.join(COMFY_DIR, "models"), emit=print)
+download_all(SPECS, MODELS_DIR, emit=print)
 CKPT = CHECKPOINT_NAME[PROFILE]
 """),
 
         _code("""
-#@title 6. Write workflows into the ComfyUI sidebar
+#@title 6. Write API workflows for the generate cells
+# API format only -- that is what cells 8/8b POST to /prompt. These are not
+# ComfyUI sidebar workflows: the sidebar wants UI format, which is a different
+# schema and is out of scope. In the tunnel UI, build graphs by hand.
 import json, os
 from colab_studio import workflows
 
-WF_DIR = os.path.join(COMFY_DIR, "user", "default", "workflows")
-os.makedirs(WF_DIR, exist_ok=True)
 API_DIR = "/content/wf_api"
 os.makedirs(API_DIR, exist_ok=True)
 
+# profile=PROFILE is what keeps a Flux checkpoint out of an SDXL-shaped graph.
 built = {
-    "sdxl_txt2img": workflows.sdxl_txt2img(CKPT, "a prompt"),
-    "upscale": workflows.upscale(CKPT, "a prompt"),
+    "txt2img": (workflows.flux_txt2img(CKPT, "a prompt")
+                if PROFILE.startswith("flux")
+                else workflows.sdxl_txt2img(CKPT, "a prompt")),
+    "img2img": workflows.img2img(CKPT, "a prompt", image="input.png",
+                                 profile=PROFILE),
 }
-if PROFILE.startswith("flux"):
-    built["flux_txt2img"] = workflows.flux_txt2img(CKPT, "a prompt")
-if CONTROLNET:
-    built["controlnet_canny"] = workflows.controlnet_canny(CKPT, "a prompt", image="input.png")
+if USE_UPSCALER:
+    built["upscale"] = workflows.upscale(CKPT, "a prompt", profile=PROFILE)
+if USE_CONTROLNET:
+    built["controlnet_canny"] = workflows.controlnet_canny(
+        CKPT, "a prompt", image="input.png", profile=PROFILE)
 
 for name, graph in built.items():
     with open(os.path.join(API_DIR, f"{name}.json"), "w") as fh:
         json.dump(graph, fh, indent=1)
-print("workflows written:", ", ".join(built))
+print(f"API workflows written to {API_DIR}: " + ", ".join(built))
 """),
 
         _code("""
@@ -238,12 +271,17 @@ use_upscaler = False  #@param {type:"boolean"}
 width, height = min(width, MAX_SIDE), min(height, MAX_SIDE)
 kw = dict(prompt=prompt, negative=negative, seed=seed, steps=steps,
           width=width, height=height)
+# Profile dispatch lives inside the builders (workflows._spine), so passing
+# profile=PROFILE is enough: on a Flux profile the cfg above is overridden to
+# 1.0 and a FluxGuidance node is wired in, whichever branch is taken.
 if use_upscaler:
-    graph = workflows.upscale(CKPT, cfg=cfg, **kw)
+    graph = workflows.upscale(CKPT, cfg=cfg, profile=PROFILE, **kw)
 elif PROFILE.startswith("flux"):
     graph = workflows.flux_txt2img(CKPT, **kw)
 else:
     graph = workflows.sdxl_txt2img(CKPT, cfg=cfg, **kw)
+if PROFILE.startswith("flux") and cfg != 1.0:
+    print(f"note: Flux ignores cfg; using 1.0 with FluxGuidance, not {cfg}.")
 
 for i, data in enumerate(CLIENT.generate(graph)):
     path = f"/content/gen_{i}.png"
@@ -254,38 +292,51 @@ for i, data in enumerate(CLIENT.generate(graph)):
 
         _code("""
 #@title 8b. Image-to-image / ControlNet (upload or URL)
-import os, requests
-from IPython.display import Image, display
-from colab_studio import workflows
-
+run_this = False  #@param {type:"boolean"}
 source = "upload"  #@param ["upload", "url"]
 image_url = ""  #@param {type:"string"}
 mode = "img2img"  #@param ["img2img", "controlnet"]
 prompt2 = "an oil painting of the same scene"  #@param {type:"string"}
 denoise = 0.6  #@param {type:"slider", min:0.1, max:1.0, step:0.05}
 
-local = "/content/source_image.png"
-if source == "upload":
-    from google.colab import files
-    up = files.upload()
-    name = next(iter(up))
-    with open(local, "wb") as fh:
-        fh.write(up[name])
+# Gated on purpose: source="upload" opens a file picker that blocks the
+# kernel, so an ungated body would stall "Runtime > Run all" here and leave
+# every cell below unreachable -- exactly the bug this notebook exists to fix.
+if not run_this:
+    print("Skipped so Run all can continue. Tick run_this, then run this "
+          "cell on its own.")
+elif mode == "controlnet" and not USE_CONTROLNET:
+    print("ControlNet is not available: tick CONTROLNET in cell 1 (SDXL "
+          "profiles only) and rerun cell 5 to fetch the weights.")
 else:
-    with open(local, "wb") as fh:
-        fh.write(requests.get(image_url, timeout=60).content)
+    import requests
+    from IPython.display import Image, display
+    from colab_studio import workflows
 
-server_name = CLIENT.upload_image(local)
-if mode == "controlnet":
-    graph = workflows.controlnet_canny(CKPT, prompt2, image=server_name)
-else:
-    graph = workflows.img2img(CKPT, prompt2, image=server_name, denoise=denoise)
+    local = "/content/source_image.png"
+    if source == "upload":
+        from google.colab import files
+        up = files.upload()
+        name = next(iter(up))
+        with open(local, "wb") as fh:
+            fh.write(up[name])
+    else:
+        with open(local, "wb") as fh:
+            fh.write(requests.get(image_url, timeout=60).content)
 
-for i, data in enumerate(CLIENT.generate(graph)):
-    path = f"/content/edit_{i}.png"
-    with open(path, "wb") as fh:
-        fh.write(data)
-    display(Image(filename=path))
+    server_name = CLIENT.upload_image(local)
+    if mode == "controlnet":
+        graph = workflows.controlnet_canny(CKPT, prompt2, image=server_name,
+                                           profile=PROFILE)
+    else:
+        graph = workflows.img2img(CKPT, prompt2, image=server_name,
+                                  denoise=denoise, profile=PROFILE)
+
+    for i, data in enumerate(CLIENT.generate(graph)):
+        path = f"/content/edit_{i}.png"
+        with open(path, "wb") as fh:
+            fh.write(data)
+        display(Image(filename=path))
 """),
 
         _code("""
@@ -313,7 +364,10 @@ elif action == "restart server":
     SERVER = start_server(COMFY_DIR, LAUNCH_FLAGS, SERVER_LOG, port=PORT)
     print("restarted:", CLIENT.wait_ready(timeout=300))
 elif action == "re-tunnel":
-    from colab_studio.launch import start_tunnel
+    from colab_studio.launch import start_tunnel, stop_tunnel
+    # Kill the old cloudflared first: it holds an fd on TUNNEL_LOG, and two
+    # tunnels on one port leaves the first one unreachable from here.
+    print("stopped previous tunnel:", stop_tunnel())
     print("URL:", start_tunnel(PORT, TUNNEL_LOG))
 else:
     for root, _, fs in os.walk(os.path.join(COMFY_DIR, "models")):
@@ -329,7 +383,7 @@ else:
 
 | Profile | Download | Needs | Notes |
 |---|---|---|---|
-| `sdxl` | 6.8 GB | ~12 GB VRAM at 1024px | Best all-rounder on a T4 |
+| `sdxl` | 6.46 GB | ~12 GB VRAM at 1024px | Best all-rounder on a T4 |
 | `flux-dev` | 16.1 GB | ~20 GB VRAM | All-in-one fp8: UNet + T5 + CLIP-L + VAE |
 | `flux-schnell` | 16.1 GB | ~20 GB VRAM | 4-step; much faster, slightly lower fidelity |
 | upscaler | 0.06 GB | negligible | 4x-UltraSharp, image-space |
@@ -355,6 +409,9 @@ guidance rides on the `FluxGuidance` node. Any other cfg scorches the image.
 | `No such file or directory: ...safetensors` | Download interrupted | Rerun cell 5 - it skips completed files |
 | Disk full mid-download | Flux is 16 GB | Use `sdxl`, or set `PERSIST="off"` to reclaim Drive space |
 | Generate cell hangs | Server died | Check cell 9 log, then "restart server" in cell 10 |
+| `ComfyError: execution failed` | A node raised at runtime | The message names the node and exception; usually OOM - drop resolution |
+| Cell 8b did nothing | `run_this` is unticked | Tick it; it defaults off so **Run all** does not stall on the file picker |
+| ControlNet disabled on Flux | Canny weights are SDXL | Set `IMAGE_MODEL="sdxl"` in cell 1, or use img2img instead |
 | Session dropped | Colab idle timeout | Rerun all; with `PERSIST` on, models and outputs survive |
 
 ### Adding a LoRA without leaving Colab
