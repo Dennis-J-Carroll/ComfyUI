@@ -12,7 +12,7 @@ import numpy as np
 import math
 import os
 import torch
-from .._util import VideoContainer, VideoCodec, VideoComponents
+from .._util import VideoContainer, VideoCodec, VideoComponents, normalize_crop_rect
 import logging
 
 
@@ -116,7 +116,8 @@ class VideoFromFile(VideoInput):
     Class representing video input from a file.
     """
 
-    def __init__(self, file: str | io.BytesIO, *, start_time: float=0, duration: float=0):
+    def __init__(self, file: str | io.BytesIO, *, start_time: float=0, duration: float=0,
+                 crop: tuple[int, int, int, int] | None = None):
         """
         Initialize the VideoFromFile object based off of either a path on disk or a BytesIO object
         containing the file contents.
@@ -124,6 +125,7 @@ class VideoFromFile(VideoInput):
         self.__file = file
         self.__start_time = start_time
         self.__duration = duration
+        self.__crop = crop
 
     def get_stream_source(self) -> str | io.BytesIO:
         """
@@ -153,6 +155,10 @@ class VideoFromFile(VideoInput):
             for stream in container.streams:
                 if stream.type == 'video':
                     assert isinstance(stream, av.VideoStream)
+                    if self.__crop is not None:
+                        rect = normalize_crop_rect(*self.__crop, stream.width, stream.height)
+                        if rect is not None:
+                            return rect[2], rect[3]
                     return stream.width, stream.height
         raise ValueError(f"No video stream found in file '{self.__file}'")
 
@@ -323,6 +329,8 @@ class VideoFromFile(VideoInput):
         streams = [video_stream]
         has_first_audio_frame = False
         checked_alpha = False
+        crop_rect = None
+        crop_resolved = False
 
         # Default to False so we decode until EOF if duration is 0
         video_done = False
@@ -396,6 +404,13 @@ class VideoFromFile(VideoInput):
                         if frame.rotation != 0:
                             k = int(round(frame.rotation // 90))
                             img = np.rot90(img, k=k, axes=(0, 1)).copy()
+                        if self.__crop is not None:
+                            if not crop_resolved:
+                                crop_rect = normalize_crop_rect(*self.__crop, img.shape[1], img.shape[0])
+                                crop_resolved = True
+                            if crop_rect is not None:
+                                cx, cy, cw, ch = crop_rect
+                                img = np.ascontiguousarray(img[cy:cy + ch, cx:cx + cw])
                         if alphas is None:
                             frames.append(torch.from_numpy(img))
                         else:
@@ -476,6 +491,8 @@ class VideoFromFile(VideoInput):
             if bit_depth is not None and video_encoding is not None and bit_depth != source_bit_depth:
                 reuse_streams = False
             if self.__start_time or self.__duration:
+                reuse_streams = False
+            if self.__crop is not None:
                 reuse_streams = False
 
             if not reuse_streams:
@@ -568,6 +585,8 @@ class VideoFromFile(VideoInput):
         source_size = None
         rotation_k = 0
         rotation_filter = None
+        crop_rect = None
+        crop_filter = None
         audio_started = False
         samples_written = 0
         pending_audio = []
@@ -646,6 +665,10 @@ class VideoFromFile(VideoInput):
                                 out_width, out_height = frame.height, frame.width
                             else:
                                 out_width, out_height = frame.width, frame.height
+                            if self.__crop is not None:
+                                crop_rect = normalize_crop_rect(*self.__crop, out_width, out_height)
+                                if crop_rect is not None:
+                                    out_width, out_height = crop_rect[2], crop_rect[3]
                             if out_width % 2 or out_height % 2:
                                 raise ValueError(f"H.264 output requires even dimensions, got {out_width}x{out_height}")
                             source_size = (frame.width, frame.height)
@@ -687,6 +710,19 @@ class VideoFromFile(VideoInput):
                                 rotation_filter = (g_src, g_sink)
                             rotation_filter[0].push(frame)
                             frame = rotation_filter[1].pull()
+                        if crop_rect is not None:
+                            if crop_filter is None:
+                                g = av.filter.Graph()
+                                g_src = g.add_buffer(width=frame.width, height=frame.height,
+                                                     format=frame.format.name, time_base=video_stream.time_base)
+                                g_crop = g.add("crop", f"{crop_rect[2]}:{crop_rect[3]}:{crop_rect[0]}:{crop_rect[1]}")
+                                g_sink = g.add("buffersink")
+                                g_src.link_to(g_crop)
+                                g_crop.link_to(g_sink)
+                                g.configure()
+                                crop_filter = (g_src, g_sink)
+                            crop_filter[0].push(frame)
+                            frame = crop_filter[1].pull()
                         if frame.color_range == ColorRange.JPEG:
                             # compress full-range sources (yuvj/MJPEG) to limited range
                             frame = frame.reformat(format=pix_fmt, src_color_range="JPEG", dst_color_range="MPEG")
@@ -794,10 +830,34 @@ class VideoFromFile(VideoInput):
             self.get_stream_source(),
             start_time=start_time + self.__start_time,
             duration=duration,
+            crop=self.__crop,
         )
         if trimmed.get_duration() < duration and strict_duration:
             return None
         return trimmed
+
+    def as_cropped(
+        self, x: int = 0, y: int = 0, width: int = 0, height: int = 0
+    ) -> VideoInput:
+        x, y, width, height = int(x), int(y), int(width), int(height)
+        if width <= 0 or height <= 0:
+            return self
+        if self.__crop is not None:
+            outer_x, outer_y, outer_width, outer_height = self.__crop
+            inner_x = max(0, x)
+            inner_y = max(0, y)
+            x = outer_x + inner_x
+            y = outer_y + inner_y
+            width = min(width, outer_width - inner_x)
+            height = min(height, outer_height - inner_y)
+            if width <= 0 or height <= 0:
+                return self
+        return VideoFromFile(
+            self.get_stream_source(),
+            start_time=self.__start_time,
+            duration=self.__duration,
+            crop=(x, y, width, height),
+        )
 
 
 class VideoFromComponents(VideoInput):
@@ -815,6 +875,8 @@ class VideoFromComponents(VideoInput):
             images=self.__components.images,
             audio=self.__components.audio,
             frame_rate=self.__components.frame_rate,
+            metadata=self.__components.metadata,
+            alpha=self.__components.alpha,
         )
 
     def get_bit_depth(self) -> int:
@@ -894,3 +956,24 @@ class VideoFromComponents(VideoInput):
             return None
         #TODO Consider tracking duration and trimming at time of save?
         return VideoFromFile(self.get_stream_source(), start_time=start_time, duration=duration)
+
+    def as_cropped(
+        self, x: int = 0, y: int = 0, width: int = 0, height: int = 0
+    ) -> VideoInput:
+        images = self.__components.images
+        rect = normalize_crop_rect(x, y, width, height, images.shape[2], images.shape[1])
+        if rect is None:
+            return self
+        crop_x, crop_y, crop_width, crop_height = rect
+        return VideoFromComponents(
+            VideoComponents(
+                images=images[:, crop_y:crop_y + crop_height, crop_x:crop_x + crop_width, :],
+                audio=self.__components.audio,
+                frame_rate=self.__components.frame_rate,
+                metadata=self.__components.metadata,
+                alpha=self.__components.alpha[:, crop_y:crop_y + crop_height, crop_x:crop_x + crop_width]
+                if self.__components.alpha is not None
+                else None,
+            ),
+            bit_depth=self.__bit_depth,
+        )
