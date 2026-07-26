@@ -2,13 +2,13 @@
 
 **For:** you, running on real Colab hardware
 **Artifact under test:** `ComfyUI_Colab_Studio.ipynb` (19 cells)
-**Branch:** `feat/colab-studio` (12 commits, not merged)
+**Branch:** `feat/colab-studio` (21 commits, not merged)
 
 ---
 
 ## Read this first: what is and isn't proven
 
-**Verified on this machine — 62 automated tests, ruff clean:**
+**Verified on this machine — 95 automated tests, ruff clean:**
 
 | Area | How it was proven |
 |---|---|
@@ -98,7 +98,7 @@ Cell 11 downloads models — SDXL is ~6.8 GB, Flux ~16.1 GB. This is the slow pa
 | 3. Install | Clones ComfyUI, pip completes | Note the error; usually a transient pip failure — rerun |
 | 4. Persistence | Drive auth prompt, then `Persisting: output, user` | |
 | 11. Download | Per-file `[+] name (X GB)` then `[v] name ready` | If it dies mid-download, rerun — it skips completed files |
-| 12. Workflows | `workflows written: sdxl_txt2img, upscale` | |
+| 12. Workflows | `API workflows written to /content/wf_api: …` | |
 | 13. Launch | `waiting for server...` then `ComfyUI ready. Public URL: https://….trycloudflare.com` | See Phase 5 |
 
 ### 🔴 The critical structural test — cell 13
