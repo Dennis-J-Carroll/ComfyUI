@@ -48,7 +48,7 @@ The notebook isn't in your Drive yet — I didn't upload anything without asking
 
 **Run cells 1 and 2 only.** Stop there. This is the cheapest, highest-value step — it needs no model downloads, so do it first even if you abandon the rest.
 
-Cell 1 is config (leave defaults: `MODE=image`, `IMAGE_MODEL=auto`, `PERSIST=outputs-only`, `CONTROLNET=False`).
+Cell 1 is config (leave defaults: `IMAGE_MODEL=auto`, `PERSIST=outputs-only`, `CONTROLNET=False`, `USE_UPSCALER=True`).
 
 Cell 2 prints your GPU, VRAM and free disk.
 
@@ -134,7 +134,7 @@ Defaults are fine. Run it.
 
 ## Phase 3 — img2img and the upload path (10 min)
 
-Run **cell 15** (`8b. Image-to-image / ControlNet`). Leave `source="upload"`, `mode="img2img"`. Pick any image.
+Run **cell 15** (`8b. Image-to-image / ControlNet`). **Tick `run_this` first** — it defaults off so that *Run all* is not stalled by the file picker, and the cell just prints a skip message until you tick it. Then leave `source="upload"`, `mode="img2img"`. Pick any image.
 
 This exercises the one piece the tunnel UI would otherwise handle for you: `POST /upload/image` → the returned `name` feeding a `LoadImage` node.
 
@@ -147,7 +147,7 @@ Also try `source="url"` with any direct image URL.
 
 ## Phase 4 — ControlNet (optional, +2.33 GB) — this is E2
 
-Only if you want ControlNet. **Set `CONTROLNET=True` in cell 1, rerun cell 11** (downloads 2.33 GB), then cell 15 with `mode="controlnet"`.
+Only if you want ControlNet, and only on an **SDXL** profile — on Flux, cell 11 disables it by design. **Set `CONTROLNET=True` in cell 1, rerun cell 11** (downloads 2.33 GB), then cell 15 with `run_this` ticked and `mode="controlnet"`.
 
 **This is the E2 test, and the riskiest download in the project.** The file is diffusers-layout (`diffusion_pytorch_model.fp16.safetensors`, renamed on the way down). I read `comfy/controlnet.py:623` and found an explicit diffusers branch, so it *should* convert — but nobody has run it. A 2.33 GB download that fails to load is the worst failure mode here.
 
@@ -191,8 +191,10 @@ Runtime → Disconnect and delete runtime. Reopen the notebook. Run all.
 |---|---|
 | Flux ignores your `cfg` slider | Flux has no classifier-free guidance. cfg is forced to 1.0; real guidance rides on `FluxGuidance`. Any other cfg scorches output. |
 | `img2img` ignores width/height | Its latent comes from your source image. |
-| Video mode is unchanged | `MODE=video` reproduces the old Wan 2.2 path; out of scope for this rewrite. |
-| ControlNet is SDXL-only | Flux ControlNet is 22.17 GB — ruled out as prohibitive. |
+| There is no video option | `MODE` was removed: it installed three custom-node repos and then generated SDXL images anyway. Video is `Wan2.2_Colab_Pipeline.ipynb`'s job. |
+| ControlNet is SDXL-only | Flux ControlNet is 22.17 GB — ruled out as prohibitive. On a Flux profile, cell 5 disables ControlNet and says so rather than downloading 2.33 GB of unusable weights. |
+| Cell 8b does nothing until you tick `run_this` | Its file picker would block **Run all** and make the cells below unreachable. Tick `run_this`, then run 8b on its own. |
+| No workflows in the ComfyUI sidebar | Only API-format graphs are produced, written to `/content/wf_api/` for cells 8 and 8b. The sidebar needs UI format, which is out of scope. |
 
 ---
 
