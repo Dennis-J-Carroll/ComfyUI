@@ -104,6 +104,63 @@ def test_controlnet_validates_and_rewires_both_conditionings(comfy):
     assert pos[1] == 0 and neg[1] == 1
 
 
+def assert_flux_sampling(g):
+    """Flux is only correct at cfg 1.0 with FluxGuidance feeding the sampler.
+
+    C3: upscale/img2img used to be SDXL-shaped (cfg 7.0, dpmpp_2m, no
+    FluxGuidance) while being handed a Flux checkpoint, which scorches output.
+    """
+    ks = [n for n in g.values() if n["class_type"] == "KSampler"][0]
+    assert ks["inputs"]["cfg"] == 1.0
+    assert ks["inputs"]["sampler_name"] == "euler"
+    assert ks["inputs"]["scheduler"] == "simple"
+    fg = [k for k, n in g.items() if n["class_type"] == "FluxGuidance"]
+    assert len(fg) == 1, "exactly one FluxGuidance node expected"
+    assert ks["inputs"]["positive"] == [fg[0], 0], "FluxGuidance not wired in"
+
+
+@pytest.mark.parametrize("profile", ["flux-dev", "flux-schnell"])
+def test_upscale_with_flux_profile_is_flux_correct(comfy, profile):
+    from colab_studio.workflows import upscale
+    g = upscale("flux1-dev-fp8.safetensors", "a cat", cfg=7.0,
+                sampler="dpmpp_2m", scheduler="karras", profile=profile)
+    assert_valid(comfy, f"upscale-{profile}", g)
+    assert_flux_sampling(g)
+
+
+@pytest.mark.parametrize("profile", ["flux-dev", "flux-schnell"])
+def test_img2img_with_flux_profile_is_flux_correct(comfy, profile):
+    from colab_studio.workflows import img2img
+    g = img2img("flux1-dev-fp8.safetensors", "a cat", image="_wf_probe.png",
+                cfg=7.0, sampler="dpmpp_2m", scheduler="karras",
+                profile=profile)
+    assert_valid(comfy, f"img2img-{profile}", g)
+    assert_flux_sampling(g)
+    assert any(n["class_type"] == "VAEEncode" for n in g.values())
+
+
+@pytest.mark.parametrize("builder", ["upscale", "img2img"])
+def test_default_profile_keeps_sdxl_sampling(comfy, builder):
+    """Adding profile= must not silently change the SDXL default path."""
+    import colab_studio.workflows as wf
+    kw = {"image": "_wf_probe.png"} if builder == "img2img" else {}
+    g = getattr(wf, builder)("sd_xl_base_1.0.safetensors", "a cat", **kw)
+    ks = [n for n in g.values() if n["class_type"] == "KSampler"][0]
+    assert ks["inputs"]["cfg"] == 7.0
+    assert ks["inputs"]["sampler_name"] == "dpmpp_2m"
+    assert not any(n["class_type"] == "FluxGuidance" for n in g.values())
+
+
+@pytest.mark.parametrize("profile", ["flux-dev", "flux-schnell"])
+def test_controlnet_canny_refuses_flux_profiles(profile):
+    """The canny weights are SDXL. There is no Flux-correct fallback graph,
+    so this must refuse rather than emit a wrong one."""
+    from colab_studio.workflows import controlnet_canny
+    with pytest.raises(ValueError, match="SDXL-only"):
+        controlnet_canny("flux1-dev-fp8.safetensors", "a cat",
+                         image="_wf_probe.png", profile=profile)
+
+
 def test_seed_and_size_are_threaded_through(comfy):
     from colab_studio.workflows import sdxl_txt2img
     g = sdxl_txt2img("sd_xl_base_1.0.safetensors", "a cat",

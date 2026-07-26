@@ -40,18 +40,15 @@ CONTROLNET_CANNY = ModelSpec(
 )
 
 PROFILES: dict[str, list[ModelSpec]] = {
+    # No standalone VAE: every builder in workflows.py takes its VAE from
+    # CheckpointLoaderSimple output 2, and none of them emits a VAELoader, so
+    # a separate sdxl-vae download is 0.31 GB that nothing ever opens.
     "sdxl": [
         ModelSpec(
             repo="stabilityai/stable-diffusion-xl-base-1.0",
             filename="sd_xl_base_1.0.safetensors",
             dest_subdir="checkpoints",
             size_gb=6.46,
-        ),
-        ModelSpec(
-            repo="stabilityai/sdxl-vae",
-            filename="sdxl_vae.safetensors",
-            dest_subdir="vae",
-            size_gb=0.31,
         ),
     ],
     # fp8 all-in-one: UNet + T5 + CLIP-L + VAE in one file, so it loads
@@ -83,8 +80,21 @@ CHECKPOINT_NAME: dict[str, str] = {
 
 def resolve(profile: str, controlnet: bool = False,
             upscale: bool = True) -> list[ModelSpec]:
-    """Full download list for a profile. Raises KeyError on unknown profile."""
+    """Full download list for a profile.
+
+    Raises KeyError on an unknown profile, and ValueError for
+    flux + controlnet: CONTROLNET_CANNY holds SDXL weights that cannot
+    condition a Flux checkpoint, so returning them would mean downloading
+    2.33 GB that workflows.controlnet_canny() will then refuse to use.
+    """
     specs = list(PROFILES[profile])
+    if controlnet and profile.startswith("flux"):
+        raise ValueError(
+            f"ControlNet is SDXL-only: {CONTROLNET_CANNY.repo} ships SDXL "
+            f"weights, unusable with the {profile!r} checkpoint. Flux "
+            "ControlNet (flux1-canny-dev, 22.17 GB) is out of scope -- use "
+            "profile='sdxl' or controlnet=False."
+        )
     if upscale:
         specs.append(UPSCALER)
     if controlnet:

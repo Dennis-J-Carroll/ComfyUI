@@ -24,6 +24,12 @@ def test_sdxl_profile_uses_stabilityai_not_comfy_org():
     assert not any(r.startswith("Comfy-Org/stable-diffusion-xl") for r in repos)
 
 
+def test_sdxl_profile_ships_no_standalone_vae():
+    """Every builder takes its VAE from CheckpointLoaderSimple output 2 and
+    none emits a VAELoader, so a separate VAE would never be opened."""
+    assert [s.dest_subdir for s in PROFILES["sdxl"]] == ["checkpoints"]
+
+
 def test_flux_dev_is_single_all_in_one_checkpoint():
     specs = PROFILES["flux-dev"]
     assert len(specs) == 1
@@ -46,3 +52,18 @@ def test_resolve_excludes_controlnet_unless_requested():
 def test_resolve_rejects_unknown_profile():
     with pytest.raises(KeyError):
         resolve("not-a-profile")
+
+
+@pytest.mark.parametrize("profile", ["flux-dev", "flux-schnell"])
+def test_resolve_rejects_controlnet_for_flux_profiles(profile):
+    """The canny weights are SDXL; returning them for Flux would download
+    2.33 GB that workflows.controlnet_canny() then refuses to use."""
+    with pytest.raises(ValueError, match="SDXL-only"):
+        resolve(profile, controlnet=True)
+
+
+@pytest.mark.parametrize("profile", ["flux-dev", "flux-schnell"])
+def test_resolve_still_serves_flux_without_controlnet(profile):
+    subdirs = [s.dest_subdir for s in resolve(profile, controlnet=False)]
+    assert "checkpoints" in subdirs
+    assert "controlnet" not in subdirs

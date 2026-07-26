@@ -44,14 +44,51 @@ def _empty_latent(width: int, height: int, batch: int) -> Graph:
             "inputs": {"width": width, "height": height, "batch_size": batch}}
 
 
+def is_flux(profile: str) -> bool:
+    """True for every Flux profile name in registry.PROFILES."""
+    return profile.startswith("flux")
+
+
+def _spine(ckpt: str, prompt: str, negative: str, seed: int, steps: int,
+           cfg: float, sampler: str, scheduler: str, denoise: float,
+           prefix: str, profile: str, guidance: float) -> Graph:
+    """`_base` plus the profile-dependent sampling contract.
+
+    THE single place the Flux-vs-SDXL decision lives. Flux ignores classifier
+    free guidance entirely: cfg must be 1.0 with the real guidance supplied by
+    a FluxGuidance node wired into KSampler.positive. Any other cfg produces
+    scorched output, so cfg/sampler/scheduler are overridden rather than
+    trusted -- every builder routes through here so no graph can be handed a
+    Flux checkpoint with SDXL-shaped sampling.
+    """
+    if is_flux(profile):
+        cfg, sampler, scheduler = 1.0, "euler", "simple"
+    g = _base(ckpt, prompt, negative, seed, steps, cfg, sampler, scheduler,
+              denoise, prefix)
+    if is_flux(profile):
+        g["8"] = {"class_type": "FluxGuidance",
+                  "inputs": {"conditioning": ["2", 0], "guidance": guidance}}
+        g["5"]["inputs"]["positive"] = ["8", 0]
+    return g
+
+
+def _txt2img(ckpt: str, prompt: str, negative: str, seed: int, steps: int,
+             cfg: float, width: int, height: int, batch: int, sampler: str,
+             scheduler: str, prefix: str, profile: str,
+             guidance: float) -> Graph:
+    g = _spine(ckpt, prompt, negative, seed, steps, cfg, sampler, scheduler,
+               1.0, prefix, profile, guidance)
+    g["4"] = _empty_latent(width, height, batch)
+    return g
+
+
 def sdxl_txt2img(ckpt: str, prompt: str, negative: str = "", seed: int = 0,
                  steps: int = 25, cfg: float = 7.0, width: int = 1024,
                  height: int = 1024, batch: int = 1,
                  sampler: str = "dpmpp_2m", scheduler: str = "karras") -> Graph:
-    g = _base(ckpt, prompt, negative, seed, steps, cfg, sampler, scheduler,
-              1.0, "colab/sdxl")
-    g["4"] = _empty_latent(width, height, batch)
-    return g
+    """SDXL txt2img: 7 nodes, dpmpp_2m/karras. Use flux_txt2img for Flux."""
+    return _txt2img(ckpt, prompt, negative, seed, steps, cfg, width, height,
+                    batch, sampler, scheduler, "colab/sdxl", "sdxl", 3.5)
 
 
 def flux_txt2img(ckpt: str, prompt: str, negative: str = "", seed: int = 0,
@@ -60,24 +97,24 @@ def flux_txt2img(ckpt: str, prompt: str, negative: str = "", seed: int = 0,
                  guidance: float = 3.5) -> Graph:
     """Flux ignores CFG entirely -- it must be 1.0, with real guidance
     supplied by FluxGuidance. Any other cfg produces scorched output, so the
-    parameter is overridden rather than trusted."""
-    g = _base(ckpt, prompt, negative, seed, steps, 1.0, "euler", "simple",
-              1.0, "colab/flux")
-    g["4"] = _empty_latent(width, height, batch)
-    g["8"] = {"class_type": "FluxGuidance",
-              "inputs": {"conditioning": ["2", 0], "guidance": guidance}}
-    g["5"]["inputs"]["positive"] = ["8", 0]
-    return g
+    parameter is overridden rather than trusted (see _spine)."""
+    return _txt2img(ckpt, prompt, negative, seed, steps, cfg, width, height,
+                    batch, "euler", "simple", "colab/flux", "flux", guidance)
 
 
 def img2img(ckpt: str, prompt: str, image: str, negative: str = "",
             seed: int = 0, steps: int = 25, cfg: float = 7.0,
             denoise: float = 0.6, sampler: str = "dpmpp_2m",
-            scheduler: str = "karras") -> Graph:
+            scheduler: str = "karras", profile: str = "sdxl",
+            guidance: float = 3.5) -> Graph:
     """`image` is a filename already present in the server's input/ dir --
-    upload it first via ComfyClient.upload_image()."""
-    g = _base(ckpt, prompt, negative, seed, steps, cfg, sampler, scheduler,
-              denoise, "colab/img2img")
+    upload it first via ComfyClient.upload_image().
+
+    Pass `profile` so a Flux checkpoint gets Flux sampling; the default is
+    SDXL-shaped.
+    """
+    g = _spine(ckpt, prompt, negative, seed, steps, cfg, sampler, scheduler,
+               denoise, "colab/img2img", profile, guidance)
     g["10"] = {"class_type": "LoadImage", "inputs": {"image": image}}
     g["4"] = {"class_type": "VAEEncode",
               "inputs": {"pixels": ["10", 0], "vae": ["1", 2]}}
@@ -88,17 +125,21 @@ def upscale(ckpt: str, prompt: str, negative: str = "", seed: int = 0,
             steps: int = 25, cfg: float = 7.0, width: int = 1024,
             height: int = 1024, batch: int = 1,
             model_name: str = "4x-UltraSharp.pth",
-            sampler: str = "dpmpp_2m", scheduler: str = "karras") -> Graph:
+            sampler: str = "dpmpp_2m", scheduler: str = "karras",
+            profile: str = "sdxl", guidance: float = 3.5) -> Graph:
     """txt2img then a pure image-space upscale. No image input, so this is
-    the one optional feature needing no upload path."""
-    g = sdxl_txt2img(ckpt, prompt, negative, seed, steps, cfg, width, height,
-                     batch, sampler, scheduler)
+    the one optional feature needing no upload path.
+
+    Pass `profile` so a Flux checkpoint gets Flux sampling; the default is
+    SDXL-shaped.
+    """
+    g = _txt2img(ckpt, prompt, negative, seed, steps, cfg, width, height,
+                 batch, sampler, scheduler, "colab/upscale", profile, guidance)
     g["11"] = {"class_type": "UpscaleModelLoader",
                "inputs": {"model_name": model_name}}
     g["12"] = {"class_type": "ImageUpscaleWithModel",
                "inputs": {"upscale_model": ["11", 0], "image": ["6", 0]}}
     g["7"]["inputs"]["images"] = ["12", 0]
-    g["7"]["inputs"]["filename_prefix"] = "colab/upscale"
     return g
 
 
@@ -109,15 +150,28 @@ def controlnet_canny(ckpt: str, prompt: str, image: str, negative: str = "",
                      high_threshold: float = 0.8,
                      control_net: str = "controlnet-canny-sdxl.safetensors",
                      sampler: str = "dpmpp_2m",
-                     scheduler: str = "karras") -> Graph:
+                     scheduler: str = "karras",
+                     profile: str = "sdxl") -> Graph:
     """SDXL only. Canny is a core node -- no comfyui_controlnet_aux needed.
 
     ControlNetApplyAdvanced emits BOTH conditionings, so the sampler's
     positive and negative must be rewired to outputs 0 and 1 of the same
     node. Rewiring only positive is a silent correctness bug.
+
+    Raises ValueError for a Flux profile: the canny weights really are SDXL
+    (registry.CONTROLNET_CANNY), and Flux ControlNet is out of scope at
+    22.17 GB. There is no Flux-correct graph to fall back to, so this refuses
+    rather than silently producing a wrong one.
     """
-    g = sdxl_txt2img(ckpt, prompt, negative, seed, steps, cfg, width, height,
-                     batch, sampler, scheduler)
+    if is_flux(profile):
+        raise ValueError(
+            f"controlnet_canny is SDXL-only: {control_net!r} holds SDXL "
+            f"weights and cannot condition the {profile!r} checkpoint "
+            f"{ckpt!r}. Flux ControlNet (flux1-canny-dev, 22.17 GB) is out of "
+            "scope -- use profile='sdxl', or img2img() for a Flux edit."
+        )
+    g = _txt2img(ckpt, prompt, negative, seed, steps, cfg, width, height,
+                 batch, sampler, scheduler, "colab/controlnet", profile, 3.5)
     g["10"] = {"class_type": "LoadImage", "inputs": {"image": image}}
     g["13"] = {"class_type": "Canny",
                "inputs": {"image": ["10", 0], "low_threshold": low_threshold,
@@ -131,5 +185,4 @@ def controlnet_canny(ckpt: str, prompt: str, image: str, negative: str = "",
                           "end_percent": 1.0}}
     g["5"]["inputs"]["positive"] = ["15", 0]
     g["5"]["inputs"]["negative"] = ["15", 1]
-    g["7"]["inputs"]["filename_prefix"] = "colab/controlnet"
     return g
