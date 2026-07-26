@@ -1,7 +1,44 @@
+import subprocess
 import sys
 import time
 
+import pytest
+
 from colab_studio import launch
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_tunnel_handle():
+    """launch._TUNNEL is module state; leaking it between tests would let one
+    test's fake process be terminated by the next."""
+    launch._TUNNEL = None
+    yield
+    launch._TUNNEL = None
+
+
+class FakeTunnel:
+    """Stands in for the cloudflared Popen."""
+
+    def __init__(self, alive=True):
+        self.returncode = None if alive else 0
+        self.terminated = False
+        self.killed = False
+        self.waited = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        self.waited = True
+        return self.returncode
 
 
 def test_start_server_returns_immediately_and_process_lives(tmp_path):
@@ -107,3 +144,76 @@ def test_start_tunnel_returns_none_when_cloudflared_missing(tmp_path, monkeypatc
 
     monkeypatch.setattr(launch.subprocess, "Popen", fake_popen)
     assert launch.start_tunnel(8188, str(log), timeout=2) is None
+    assert launch.current_tunnel() is None
+
+
+def _tunnel_popen(log, procs, write_url=True):
+    def fake_popen(cmd, **kwargs):
+        if write_url:
+            log.write_text("INF |  https://fuzzy-panda-42.trycloudflare.com  |\n")
+        p = FakeTunnel()
+        procs.append(p)
+        return p
+    return fake_popen
+
+
+def test_start_tunnel_exposes_the_process_for_shutdown(tmp_path, monkeypatch):
+    """start_tunnel returned only a URL, so the notebook held no handle on
+    cloudflared and could never stop it."""
+    log, procs = tmp_path / "cf.log", []
+    monkeypatch.setattr(launch.subprocess, "Popen", _tunnel_popen(log, procs))
+
+    assert launch.start_tunnel(8188, str(log), timeout=5)
+    assert launch.current_tunnel() is procs[0]
+
+
+def test_stop_tunnel_terminates_the_running_tunnel(tmp_path, monkeypatch):
+    log, procs = tmp_path / "cf.log", []
+    monkeypatch.setattr(launch.subprocess, "Popen", _tunnel_popen(log, procs))
+    launch.start_tunnel(8188, str(log), timeout=5)
+
+    assert launch.stop_tunnel() is True
+    assert procs[0].terminated is True
+    assert launch.current_tunnel() is None
+
+
+def test_stop_tunnel_is_a_noop_when_nothing_is_running():
+    assert launch.stop_tunnel() is False
+
+
+def test_stop_tunnel_kills_a_tunnel_that_ignores_terminate(monkeypatch):
+    class Stubborn(FakeTunnel):
+        def terminate(self):
+            self.terminated = True      # stays alive: returncode untouched
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("cloudflared", timeout)
+
+    launch._TUNNEL = proc = Stubborn()
+    assert launch.stop_tunnel(timeout=0.1) is True
+    assert proc.killed is True
+
+
+def test_retunnelling_stops_the_previous_cloudflared(tmp_path, monkeypatch):
+    """Re-tunnel used to delete the log the first cloudflared still held an fd
+    on and spawn a second process on the same port, leaving both alive."""
+    log, procs = tmp_path / "cf.log", []
+    monkeypatch.setattr(launch.subprocess, "Popen", _tunnel_popen(log, procs))
+
+    launch.start_tunnel(8188, str(log), timeout=5)
+    launch.start_tunnel(8188, str(log), timeout=5)
+
+    assert len(procs) == 2
+    assert procs[0].terminated is True, "first tunnel orphaned"
+    assert launch.current_tunnel() is procs[1]
+
+
+def test_start_tunnel_clears_the_handle_when_it_times_out(tmp_path, monkeypatch):
+    log, procs = tmp_path / "cf.log", []
+    log.write_text("INF starting...\n")
+    monkeypatch.setattr(launch.subprocess, "Popen",
+                        _tunnel_popen(log, procs, write_url=False))
+
+    assert launch.start_tunnel(8188, str(log), timeout=2) is None
+    assert procs[0].terminated is True
+    assert launch.current_tunnel() is None
