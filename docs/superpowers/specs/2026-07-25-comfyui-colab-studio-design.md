@@ -165,6 +165,20 @@ These four require a GPU. `colab-mcp` was expected to make them executable durin
 
 **Execution-time note (Task 8).** The build environment used to implement this task is CPU-only Linux with no GPU and no Colab session attached, so `colab-mcp`'s CPU-default scratch notebook was never reached in practice either — confirming, rather than resolving, the note above: a human must set Runtime → Change runtime type → GPU before E1–E3 can be attempted.
 
+### E5 — CPU end-to-end smoke test (PERFORMED, 2026-07-26)
+
+The plumbing — as distinct from the GPU-specific claims E1–E3 — has now been executed against a real ComfyUI server. Script: `scratchpad/e2e_cpu_generate.py`, driving the shipped modules with no reimplementation.
+
+| Stage | Module exercised | Observed |
+|-------|------------------|----------|
+| Download 1.99 GB SD1.5 checkpoint | `fetch.download()` | 30 s, single write via `local_dir=`, no cache-then-copy |
+| Start ComfyUI (`--cpu`) | `launch.start_server()` | **returned in 0.00 s** — non-blocking confirmed against a real server, not a fake script |
+| Readiness probe | `client.wait_ready()` | server answered `/system_stats` after 40 s |
+| Build graph | `workflows.sdxl_txt2img()` | 7 nodes, accepted by a live `POST /prompt` |
+| Submit → poll → fetch | `client.generate()` | 1 image in 145 s (384×384, 8 steps), 201,681-byte PNG |
+
+Total 185 s. **What this does and does not establish:** it proves the fetch → launch → readiness → submit → poll → fetch path works end to end against a real server, which was previously only structurally validated. It does **not** touch E1 (Flux all-in-one loading), E2 (diffusers ControlNet conversion), E3 (GPU VRAM headroom) or E4 (threshold calibration) — those are model- and hardware-specific and remain open exactly as recorded above. A different checkpoint (SD1.5) at a different resolution on a different device (CPU) was used.
+
 ---
 
 ## Tooling: `colab-mcp` (development only, non-load-bearing)
