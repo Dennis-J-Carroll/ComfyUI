@@ -1,14 +1,20 @@
 # ComfyUI Colab Studio — Manual Test Plan
 
 **For:** you, running on real Colab hardware
-**Artifact under test:** `ComfyUI_Colab_Studio.ipynb` (19 cells)
-**Branch:** `feat/colab-studio` (21 commits, not merged)
+**Artifact under test:** `ComfyUI_Colab_Studio.ipynb`
+**Branch:** PR #1 (`feat/colab-studio`) is **MERGED** into `master`
+(merge commit `6f572b1c`). Phase 0 hardening below (ComfyUI revision pin,
+opt-in tunnel, RuntimeSupervisor lifecycle) is in flight on
+`chore/colab-studio-truth-repro`, not yet merged as of this revision of
+this document.
 
 ---
 
 ## Read this first: what is and isn't proven
 
-**Verified on this machine — 95 automated tests, ruff clean:**
+**Verified on this machine — 115 automated tests
+(`tests-unit/colab_studio_test/`, computed by running the suite, not
+copied from an earlier count), ruff clean:**
 
 | Area | How it was proven |
 |---|---|
@@ -18,12 +24,13 @@
 | `start_server` does not block | A test fails if it takes >5s to return. |
 | HTTP client behaviour | Real stub HTTP server on a loopback socket. |
 | Notebook independence | No `mcp`, no `uv`/`uvx`, no developer paths, no clone of this repo. |
+| **E5** — fetch → launch → readiness → generate, end to end | Executed against a real ComfyUI server on CPU (SD1.5, 384×384, 8 steps): 1 image in 145 s. `start_server` returned in 0.00 s against a real server, not a stub. Does **not** touch E1–E4 below — those remain GPU- and model-specific. Full record: `docs/superpowers/specs/2026-07-25-comfyui-colab-studio-design.md` §E5. |
 
-**NOT verified — nobody has run a single node. This is what you're testing.**
+**NOT verified — nobody has run a single node on a GPU. This is what you're testing.**
 
 | ID | Claim | Status |
 |---|---|---|
-| **E1** | Flux fp8 all-in-one loads via `CheckpointLoaderSimple` | Inferred from file layout + 16.06 GB size. Never executed. |
+| **E1** | Flux fp8 all-in-one loads via `CheckpointLoaderSimple` | Inferred from file layout + 16.06 GB size. Never executed on GPU. |
 | **E2** | Diffusers ControlNet converts at runtime (`comfy/controlnet.py:623`) | Read from source. Never executed. |
 | **E3** | VRAM headroom per model on real hardware | Unmeasured. |
 | **E4** | The VRAM→profile→flags thresholds (12.0 / 20.0 GB) | Implemented and boundary-unit-tested. **Never calibrated against a real GPU.** |
@@ -32,15 +39,54 @@ If something below fails, that's the test doing its job. Record it rather than w
 
 ---
 
+## Tunnel behaviour (`OPEN_PUBLIC_UI`)
+
+The launch cell no longer starts a public Cloudflare Quick Tunnel by
+default. This changed after the merge above — if you're testing an older
+checkout, this section won't apply yet.
+
+- **Default (`OPEN_PUBLIC_UI = False` in cell 1):** the server starts, cell
+  7 waits for readiness, and **no tunnel is opened**. `Runtime > Run all`
+  reaches every cell with no public URL ever printed. Use cell 8 / 8b to
+  generate inline — that path needs no tunnel at all.
+- **To enable:** set `OPEN_PUBLIC_UI = True` in cell 1, then run (or
+  rerun) cell 7. It prints a warning *before* the tunnel starts, then
+  starts it — only after `wait_ready()` has already succeeded, same
+  ordering guarantee as before.
+- **What to check:**
+  - With the default off, confirm no `trycloudflare.com` URL appears
+    anywhere in cell 7's output on a plain `Run all`.
+  - With it on, confirm the warning prints *before* the URL, and that the
+    warning says plainly that the URL is not authentication.
+  - Cell 10's `re-tunnel` action still works for restarting a tunnel
+    manually (independent of `OPEN_PUBLIC_UI`, since picking that action
+    is itself an explicit request) and still stops the previous tunnel
+    first — check no stale `trycloudflare.com` URL keeps answering after
+    a re-tunnel.
+- **Nothing about the tunnel is secured.** It's a public URL with no
+  authentication in front of it, whether opened from cell 7 or cell 10.
+  Treat it as fully public for as long as it's up.
+
+---
+
 ## Phase 0 — Get the notebook into Colab (5 min)
 
-**Option A — open straight from GitHub (fastest, no upload).** The branch is pushed to your fork, so Colab can open it directly:
+**Option A — open straight from GitHub (fastest, no upload).** PR #1 is
+merged into `master`, so Colab can open the merged notebook directly:
 
 ```
-https://colab.research.google.com/github/Dennis-J-Carroll/ComfyUI/blob/feat/colab-studio/ComfyUI_Colab_Studio.ipynb
+https://colab.research.google.com/github/Dennis-J-Carroll/ComfyUI/blob/master/ComfyUI_Colab_Studio.ipynb
 ```
 
-Colab opens it read-only from the branch; use *File → Save a copy in Drive* if you want to keep your edits. PR for review: https://github.com/Dennis-J-Carroll/ComfyUI/pull/1
+For a reproducible link that won't move under you as `master` gets more
+commits, pin to the merge commit instead:
+
+```
+https://colab.research.google.com/github/Dennis-J-Carroll/ComfyUI/blob/6f572b1c/ComfyUI_Colab_Studio.ipynb
+```
+
+Colab opens either read-only from that ref; use *File → Save a copy in
+Drive* if you want to keep your edits. Merged PR: https://github.com/Dennis-J-Carroll/ComfyUI/pull/1
 
 **Option B — I push it to your Drive.** Say the word and I'll upload via the Google Drive MCP and hand you the link. Nothing has gone into your Drive so far.
 
@@ -201,7 +247,7 @@ Runtime → Disconnect and delete runtime. Reopen the notebook. Run all.
 |---|---|
 | Flux ignores your `cfg` slider | Flux has no classifier-free guidance. cfg is forced to 1.0; real guidance rides on `FluxGuidance`. Any other cfg scorches output. |
 | `img2img` ignores width/height | Its latent comes from your source image. |
-| There is no video option | `MODE` was removed: it installed three custom-node repos and then generated SDXL images anyway. Video is `Wan2.2_Colab_Pipeline.ipynb`'s job. |
+| There is no video option | `MODE` was removed: it installed three custom-node repos and then generated SDXL images anyway. Video generation is not yet shipped in Colab Studio. |
 | ControlNet is SDXL-only | Flux ControlNet is 22.17 GB — ruled out as prohibitive. On a Flux profile, cell 5 disables ControlNet and says so rather than downloading 2.33 GB of unusable weights. |
 | Cell 8b does nothing until you tick `run_this` | Its file picker would block **Run all** and make the cells below unreachable. Tick `run_this`, then run 8b on its own. |
 | No workflows in the ComfyUI sidebar | Only API-format graphs are produced, written to `/content/wf_api/` for cells 8 and 8b. The sidebar needs UI format, which is out of scope. |
@@ -260,7 +306,7 @@ The three things I most want, in order: **the E4 calibration numbers from Phase 
 
 ```bash
 cd /home/dennisjcarroll/Desktop/ComfyUI
-.venv/bin/python -m pytest tests-unit/colab_studio_test/ -v   # 62 tests
+.venv/bin/python -m pytest tests-unit/colab_studio_test/ -v   # count drifts -- see the collected total the run prints
 ~/.local/bin/ruff check colab_studio/ tests-unit/colab_studio_test/ build_notebook.py
 ```
 
