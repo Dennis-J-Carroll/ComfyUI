@@ -154,16 +154,52 @@ These four require a GPU. `colab-mcp` was expected to make them executable durin
 
 | # | Claim | Currently |
 |---|-------|-----------|
-| E1 | Flux fp8 all-in-one loads via `CheckpointLoaderSimple` | still unverified — requires a live Colab GPU runtime; no GPU in the build environment |
-| E2 | diffusers ControlNet state dict converts at runtime (`comfy/controlnet.py:623`) | still unverified — requires a live Colab GPU runtime; no GPU in the build environment |
-| E3 | VRAM headroom per model on the actually-assigned GPU | still unverified — requires a live Colab GPU runtime; no GPU in the build environment |
-| E4 | Cell 2's VRAM→model→resolution→flags thresholds | thresholds implemented and unit-tested at boundaries (12.0, 20.0); NOT calibrated against real hardware — requires a live Colab GPU runtime |
+| E1 | Flux fp8 all-in-one loads via `CheckpointLoaderSimple` | **CLOSED — GPU_E2E, 2026-07-27, Colab Pro A100.** See E6 below. |
+| E2 | diffusers ControlNet state dict converts at runtime (`comfy/controlnet.py:623`) | **still open.** The A100 run auto-selected `flux-dev`, and the Flux guard correctly refused the SDXL canny weights ("Skipping a 2.33 GB unusable download"), so E2 was never reachable. Requires a run with `IMAGE_MODEL="sdxl"` + `CONTROLNET=True`. |
+| E3 | VRAM headroom per model on the actually-assigned GPU | **partially closed.** Flux dev fp8 at 1024×1024, 25 steps, `--highvram` completed on a 40 GB A100 with no OOM. Peak VRAM was not instrumented, so the headroom *margin* is still unmeasured. |
+| E4 | Cell 2's VRAM→model→resolution→flags thresholds | **high tier CONFIRMED on A100** (see E6). Low (<12 GB) and mid (12–20 GB) tiers remain uncalibrated — no T4 or L4 run yet. |
 
 **Run E4 first.** It needs only `torch.cuda.get_device_properties().total_memory` and `nvidia-smi` — seconds, no downloads. E1–E3 require 16 GB (Flux) and 2.33 GB (ControlNet) pulls that may stall. Sequencing E4 first unblocks the one genuinely opinionated piece of the design regardless of how the heavy downloads go. It should be calibrated against observed numbers, not guessed.
 
 **Prerequisite — GPU runtime.** `colab-mcp` opens a scratch notebook, and Colab's default runtime is **CPU**. E1 and E3 require a GPU runtime; E2 requires one to instantiate the ControlNet. Whether the proxied tool set can change runtime type is **unverified** — the tool list is empty until the browser connects, so it is only answerable live. Until confirmed, assume the human must set Runtime → Change runtime type → GPU before E1–E3, and treat that as a documented step rather than a surprise.
 
 **Execution-time note (Task 8).** The build environment used to implement this task is CPU-only Linux with no GPU and no Colab session attached, so `colab-mcp`'s CPU-default scratch notebook was never reached in practice either — confirming, rather than resolving, the note above: a human must set Runtime → Change runtime type → GPU before E1–E3 can be attempted.
+
+### E6 — GPU end-to-end on Colab Pro A100 (PERFORMED, 2026-07-27)
+
+First real GPU run, executed by the repo owner on the Phase-0 notebook (`chore/colab-studio-truth-repro`; `SUPERVISOR` and `OPEN_PUBLIC_UI` both present in the executed cells).
+
+**Hardware and selection**
+
+| Observed | Value |
+|---|---|
+| GPU | A100 (Colab Pro) |
+| Disk free at `models/` | 188 GB |
+| `tier=` | `high` |
+| `profile=` | `flux-dev` |
+| `max_side=` | 1024 |
+| `launch flags:` | `--highvram` |
+
+The advice heuristic behaved exactly as designed on this tier: A100 → high → Flux dev fp8 at 1024px with `--highvram`.
+
+**Download** — `flux1-dev-fp8.safetensors` fetched at 221 MB/s; `4x-UltraSharp.pth` alongside it. Both landed via the single-write `local_dir=` path.
+
+**Generation** — 1024×1024, 25 steps, `use_upscaler=False`. Server log: `Prompt executed in 13.85 seconds`, ~1.91 it/s steady-state. Cell 8 wall time ~11 s on a warm model. A real image was returned and displayed inline, with no tunnel open.
+
+**What this closes**
+
+- **E1 — CLOSED.** The 16.06 GiB all-in-one fp8 checkpoint loaded through `CheckpointLoaderSimple` and produced a correct image. This was the largest inferred-not-observed assumption in the build; it held.
+- **E4 high tier — CONFIRMED.** Threshold, profile, resolution cap and launch flag all matched the design on real hardware.
+- **Flux sampling contract — CONFIRMED end to end.** Cell 8 printed `note: Flux ignores cfg; using 1.0 with FluxGuidance, not 7.0`, i.e. `workflows._spine()` overrode the user's cfg and wired `FluxGuidance` on a live run, not just in a unit test.
+- **Flux/ControlNet guard — CONFIRMED.** `USE_CONTROLNET` was auto-disabled with "Skipping a 2.33 GB unusable download", so the guard saved a real download of weights that could not have worked.
+- **Opt-in tunnel (Phase 0, 0.d) — CONFIRMED.** Generation ran inline with no public URL printed.
+- **img2img path — exercised.** `edit_0.png` and `source_image.png` were present in the runtime, so cell 8b's upload → `LoadImage` → generate path ran.
+
+**What this does not close** — E2 (unreachable on a Flux profile), E3's peak-VRAM margin (not instrumented), and E4's low/mid tiers (no T4 or L4 run).
+
+**Documentation defect found by this run:** `registry.py` sizes are GiB but read as "GB". Colab reported `17.2GB` on disk for the entry declared `16.06`; 16.06 GiB = 17.24 GB decimal. The numbers are right, the unit label is not.
+
+---
 
 ### E5 — CPU end-to-end smoke test (PERFORMED, 2026-07-26)
 
