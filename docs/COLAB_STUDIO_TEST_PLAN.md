@@ -12,7 +12,7 @@ this document.
 
 ## Read this first: what is and isn't proven
 
-**Verified on this machine — 115 automated tests
+**Verified on this machine — 116 automated tests
 (`tests-unit/colab_studio_test/`, computed by running the suite, not
 copied from an earlier count), ruff clean:**
 
