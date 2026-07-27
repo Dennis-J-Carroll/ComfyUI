@@ -14,8 +14,10 @@ from __future__ import annotations
 import json
 import os
 
-MODULES = ["registry.py", "advice.py", "workflows.py", "fetch.py",
-           "client.py", "launch.py"]
+from colab_studio import compat
+
+MODULES = ["compat.py", "registry.py", "advice.py", "workflows.py",
+           "fetch.py", "client.py", "launch.py"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -45,20 +47,22 @@ def build(out_path: str) -> dict:
 # ComfyUI Colab Studio
 
 Self-contained. Nothing to upload. **Runtime > Run all**, then use the
-generate cell at the bottom or open the tunnel URL.
+generate cell at the bottom. No public URL is opened unless you turn one
+on in cell 1.
 
-This notebook does **images**. Video stays in `Wan2.2_Colab_Pipeline.ipynb`.
+This notebook does **images** only. Video generation is not yet shipped in
+Colab Studio.
 
 | Cell | What it does |
 |---|---|
-| 1 | Pick model + persistence options |
+| 1 | Pick model, persistence, ComfyUI pin, and public-tunnel options |
 | 2 | Detect GPU and disk |
-| 3 | Install ComfyUI |
+| 3 | Install ComfyUI, pinned to the tested revision by default |
 | 4 | Link Drive (optional persistence) |
 | *(6 unnumbered)* | `%%writefile` the helper library into `colab_studio/` |
 | 5 | Choose profile, re-check disk, download models |
 | 6 | Write API workflows for the generate cells |
-| 7 | Start the server **in the background** and open a public URL |
+| 7 | Start the server **in the background**; open a public tunnel only if `OPEN_PUBLIC_UI` is on |
 | 8 | Generate an image without leaving this notebook |
 | 8b | Image-to-image / ControlNet - **tick `run_this` first**; Run all skips it |
 | 9-10 | Logs, restart, free VRAM, disk usage, re-tunnel |
@@ -71,10 +75,16 @@ IMAGE_MODEL = "auto"  #@param ["auto", "sdxl", "flux-dev", "flux-schnell"]
 PERSIST = "outputs-only"  #@param ["outputs-only", "everything", "off"]
 CONTROLNET = False  #@param {type:"boolean"}
 USE_UPSCALER = True  #@param {type:"boolean"}
+COMFY_REF = "pinned"  #@param ["pinned", "latest"]
+OPEN_PUBLIC_UI = False  #@param {type:"boolean"}
 PORT = 8188
 COMFY_DIR = "/content/ComfyUI"
 print(f"model={IMAGE_MODEL} persist={PERSIST} "
       f"controlnet={CONTROLNET} upscaler={USE_UPSCALER}")
+print(f"comfy_ref={COMFY_REF} open_public_ui={OPEN_PUBLIC_UI}")
+if OPEN_PUBLIC_UI:
+    print("!! OPEN_PUBLIC_UI is on: cell 7 will start a public Cloudflare "
+          "tunnel. The URL is not authentication -- see cell 7's warning.")
 """),
 
         _code("""
@@ -95,13 +105,36 @@ print(f"GPU:  {GPU_NAME}  ({VRAM_GB:.1f} GB VRAM)")
 print(f"Disk: {DISK_FREE_GB:.0f} GB free on /content")
 """),
 
-        _code("""
+        _code(f"""
 #@title 3. Install ComfyUI
 import os
 %cd /content
 if not os.path.isdir(COMFY_DIR):
-    !git clone https://github.com/comfyanonymous/ComfyUI.git {COMFY_DIR}
-%cd {COMFY_DIR}
+    !git clone {compat.REPO_URL}.git {{COMFY_DIR}}
+%cd {{COMFY_DIR}}
+
+# Kept in sync with colab_studio/compat.py -- that module is the source of
+# truth; this literal is generated from it, not hand-typed twice.
+TESTED_REF = "{compat.TESTED_REF}"
+if COMFY_REF == "pinned":
+    !git fetch --quiet origin
+    !git checkout --quiet {{TESTED_REF}}
+else:
+    print("!" * 70)
+    print("!! UNSUPPORTED: COMFY_REF='latest'. Colab Studio's workflow graphs")
+    print("!! were structurally validated only against {compat.short_ref()} "
+          "({compat.TESTED_DATE}).")
+    print("!! Upstream node contracts, input names, or defaults may have")
+    print("!! changed since then -- generation can fail in ways nobody here")
+    print("!! has tested. Set COMFY_REF='pinned' in cell 1 unless you")
+    print("!! specifically need something newer than that.")
+    print("!" * 70)
+    !git fetch --quiet origin master
+    !git checkout --quiet FETCH_HEAD
+
+resolved = !git rev-parse HEAD
+print("ComfyUI commit:", resolved[0])
+
 !pip install -q -r requirements.txt
 !pip install -q huggingface_hub torchsde requests
 # Core ComfyUI only: every node these workflows use ships with it, so there
@@ -230,26 +263,45 @@ print(f"API workflows written to {API_DIR}: " + ", ".join(built))
 """),
 
         _code("""
-#@title 7. Launch server (backgrounded) then open the tunnel
+#@title 7. Launch server (backgrounded); tunnel only if OPEN_PUBLIC_UI
 import os
 from colab_studio.client import ComfyClient
-from colab_studio.launch import start_server, start_tunnel
+from colab_studio.launch import RuntimeSupervisor
 
-if not os.path.isfile("/usr/local/bin/cloudflared"):
-    !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
-    !chmod +x /usr/local/bin/cloudflared
+# RuntimeSupervisor owns the server + tunnel lifecycle (single-server guard,
+# closed log handles, atexit cleanup on kernel death) so this cell doesn't
+# have to reimplement any of that.
+SUPERVISOR = RuntimeSupervisor()
 
 SERVER_LOG = "/content/comfyui.log"
 TUNNEL_LOG = "/content/cloudflared.log"
 
-SERVER = start_server(COMFY_DIR, LAUNCH_FLAGS, SERVER_LOG, port=PORT)
+SERVER = SUPERVISOR.start_server(COMFY_DIR, LAUNCH_FLAGS, SERVER_LOG, port=PORT)
 CLIENT = ComfyClient(f"http://127.0.0.1:{PORT}")
 
 print("waiting for server...")
-if CLIENT.wait_ready(timeout=300):
-    # Tunnel only AFTER readiness, or the URL 502s.
-    URL = start_tunnel(PORT, TUNNEL_LOG)
-    print("ComfyUI ready.  Public URL:", URL or "(tunnel failed, see cell 10)")
+if SUPERVISOR.wait_ready(timeout=300, client=CLIENT):
+    print("ComfyUI ready.")
+    if OPEN_PUBLIC_UI:
+        # A Quick Tunnel URL is obscurity, not authentication: anyone who
+        # has it (or finds it) can generate, upload, browse output history,
+        # and reach ComfyUI's management-adjacent routes. Nothing below
+        # secures it -- treat the URL as fully public.
+        print("!" * 70)
+        print("!! WARNING: OPEN_PUBLIC_UI is on. Starting a public tunnel.")
+        print("!! The URL is NOT authentication. Anyone who has it can use")
+        print("!! this ComfyUI server: generate, upload, and read history.")
+        print("!" * 70)
+        if not os.path.isfile("/usr/local/bin/cloudflared"):
+            !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
+            !chmod +x /usr/local/bin/cloudflared
+        # Tunnel only AFTER readiness, or the URL 502s.
+        URL = SUPERVISOR.start_tunnel(PORT, TUNNEL_LOG)
+        print("Public URL:", URL or "(tunnel failed, see cell 10)")
+    else:
+        print("OPEN_PUBLIC_UI is off -- no public tunnel started. Use cells "
+              "8/8b to generate here, or set OPEN_PUBLIC_UI=True in cell 1 "
+              "and rerun this cell for a tunnel.")
 else:
     print("server did not come up - run the log cell below")
 """),
@@ -359,16 +411,15 @@ elif action == "free VRAM":
                   json={"unload_models": True, "free_memory": True}, timeout=30)
     print("asked ComfyUI to unload models")
 elif action == "restart server":
-    from colab_studio.launch import start_server
-    SERVER.terminate(); SERVER.wait(timeout=30)
-    SERVER = start_server(COMFY_DIR, LAUNCH_FLAGS, SERVER_LOG, port=PORT)
+    SERVER = SUPERVISOR.restart_server(COMFY_DIR, LAUNCH_FLAGS, SERVER_LOG, port=PORT)
     print("restarted:", CLIENT.wait_ready(timeout=300))
 elif action == "re-tunnel":
-    from colab_studio.launch import start_tunnel, stop_tunnel
+    # Same warning as cell 7: the URL is not authentication.
+    print("!! Public tunnel: anyone with the URL can use this server.")
     # Kill the old cloudflared first: it holds an fd on TUNNEL_LOG, and two
     # tunnels on one port leaves the first one unreachable from here.
-    print("stopped previous tunnel:", stop_tunnel())
-    print("URL:", start_tunnel(PORT, TUNNEL_LOG))
+    print("stopped previous tunnel:", SUPERVISOR.stop_tunnel())
+    print("URL:", SUPERVISOR.start_tunnel(PORT, TUNNEL_LOG))
 else:
     for root, _, fs in os.walk(os.path.join(COMFY_DIR, "models")):
         for f in fs:
@@ -404,6 +455,7 @@ guidance rides on the `FluxGuidance` node. Any other cfg scorches the image.
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| No public URL printed | `OPEN_PUBLIC_UI` is off by default | Set `OPEN_PUBLIC_UI=True` in cell 1 and rerun cell 7, or run cell 10's `re-tunnel` action. **The URL is not authentication** -- anyone who has it can use this server. |
 | Tunnel URL 502s | Server still booting | Rerun cell 7; it waits for readiness first |
 | `CUDA out of memory` | Resolution or batch too high | Drop to 768px, batch 1, run "free VRAM" in cell 10 |
 | `No such file or directory: ...safetensors` | Download interrupted | Rerun cell 5 - it skips completed files |

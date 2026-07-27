@@ -4,6 +4,7 @@ import re
 import pytest
 
 import build_notebook
+from colab_studio import compat
 
 COMMITTED_NB = os.path.join(build_notebook.HERE, "ComfyUI_Colab_Studio.ipynb")
 
@@ -217,3 +218,78 @@ def test_handbook_cell_present_with_troubleshooting(nb):
     blob = "\n".join("".join(c["source"]) for c in md).lower()
     assert "out of memory" in blob or "oom" in blob
     assert "disk" in blob
+
+
+# --- Phase 0 items 0.b / 0.c / 0.d --------------------------------------
+
+def test_no_wan_reference_anywhere(nb):
+    """0.c: Wan2.2_Colab_Pipeline.ipynb has never been committed to any
+    branch -- it's a dead end for every user but this one machine."""
+    blob = json.dumps(nb)
+    assert "Wan2.2_Colab_Pipeline" not in blob
+
+
+def test_pinned_tested_ref_present(nb):
+    """0.b: the install cell must actually use the exact revision the
+    graphs were validated against. Sourced from colab_studio/compat.py, not
+    hardcoded here, so this can't drift from the single source of truth.
+
+    Scoped to cell 3's own source, not the whole notebook -- compat.py's
+    module body is separately inlined via %%writefile and would otherwise
+    satisfy a whole-notebook substring check whether or not cell 3's
+    install logic wires the ref in at all.
+    """
+    src = cell_titled(nb, "3.")
+    assert compat.TESTED_REF in src
+
+
+def test_latest_ref_prints_unsupported_warning(nb):
+    """0.b: choosing COMFY_REF='latest' must warn, clearly, that the graphs
+    were only validated against the pinned ref."""
+    src = cell_titled(nb, "3.")
+    idx_branch = src.index('COMFY_REF == "pinned"')
+    idx_warning = src.index("UNSUPPORTED")
+    assert idx_branch < idx_warning, \
+        "UNSUPPORTED warning must live in the COMFY_REF branch, not before it"
+
+
+def test_open_public_ui_defaults_false(nb):
+    """0.d: the public tunnel must be opt-in, off by default."""
+    src = cell_titled(nb, "1.")
+    assert re.search(r'OPEN_PUBLIC_UI = False\s+#@param \{type:"boolean"\}', src)
+
+
+def test_start_tunnel_guarded_by_open_public_ui(nb):
+    """0.d: Run All with defaults must never reach start_tunnel. Every
+    non-import call to start_tunnel in the launch cell must be indented
+    strictly deeper than the `if OPEN_PUBLIC_UI` line that guards it, and
+    must appear after it."""
+    src = cell_titled(nb, "7.")
+    lines = src.splitlines()
+
+    guard_indent = None
+    guard_idx = None
+    for i, line in enumerate(lines):
+        if re.match(r"\s*if OPEN_PUBLIC_UI\b", line):
+            guard_idx = i
+            guard_indent = len(line) - len(line.lstrip(" "))
+            break
+    assert guard_idx is not None, "launch cell has no `if OPEN_PUBLIC_UI` guard"
+
+    calls = [(i, line) for i, line in enumerate(lines)
+             if "start_tunnel(" in line and "import" not in line]
+    assert calls, "launch cell never calls start_tunnel"
+    for i, line in calls:
+        assert i > guard_idx, f"start_tunnel called before the OPEN_PUBLIC_UI guard: {line!r}"
+        call_indent = len(line) - len(line.lstrip(" "))
+        assert call_indent > guard_indent, \
+            f"start_tunnel is not nested inside the OPEN_PUBLIC_UI guard: {line!r}"
+
+
+def test_wait_ready_precedes_start_tunnel_within_launch_cell(nb):
+    """0.d: tunnel must only start after wait_ready() succeeds. Scoped to
+    the launch cell's own source so a coincidental match against inlined
+    library code (wait_ready lives in client.py, start_tunnel in
+    launch.py) can't satisfy this vacuously."""
+    src = cell_titled(nb, "7.")
+    assert src.index("wait_ready(") < src.index("start_tunnel(")
