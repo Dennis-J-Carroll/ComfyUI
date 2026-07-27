@@ -270,8 +270,15 @@ from colab_studio.launch import RuntimeSupervisor
 
 # RuntimeSupervisor owns the server + tunnel lifecycle (single-server guard,
 # closed log handles, atexit cleanup on kernel death) so this cell doesn't
-# have to reimplement any of that.
-SUPERVISOR = RuntimeSupervisor()
+# have to reimplement any of that. The single-server guard is per-instance
+# (see launch.py), so re-running this cell must reuse the same instance --
+# a fresh RuntimeSupervisor() on every run would have no memory of the
+# server the previous run started, spawn a second one that fails to bind
+# the port, and then silently report "ready" off the first, orphaned one.
+try:
+    SUPERVISOR
+except NameError:
+    SUPERVISOR = RuntimeSupervisor()
 
 SERVER_LOG = "/content/comfyui.log"
 TUNNEL_LOG = "/content/cloudflared.log"

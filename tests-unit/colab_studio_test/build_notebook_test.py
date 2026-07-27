@@ -286,6 +286,23 @@ def test_start_tunnel_guarded_by_open_public_ui(nb):
             f"start_tunnel is not nested inside the OPEN_PUBLIC_UI guard: {line!r}"
 
 
+def test_launch_cell_reuses_supervisor_across_reruns(nb):
+    """0.d: RuntimeSupervisor's single-server guard (self._server) is
+    per-instance, not module state (unlike _TUNNEL). An unconditional
+    `SUPERVISOR = RuntimeSupervisor()` at the top of the launch cell would
+    forget the server the previous run started on every re-run, spawn a
+    second process that fails to bind the port, and report readiness off
+    the first, now-orphaned one -- silently defeating the guard this cell
+    exists to apply. The cell must only construct a fresh instance when
+    none already exists in the kernel's namespace."""
+    src = cell_titled(nb, "7.")
+    assert not re.search(r"^SUPERVISOR = RuntimeSupervisor\(\)", src, re.M), (
+        "launch cell unconditionally rebinds SUPERVISOR on every run -- "
+        "a re-run loses the single-server guard")
+    assert "SUPERVISOR = RuntimeSupervisor()" in src, \
+        "launch cell never constructs a SUPERVISOR at all"
+
+
 def test_wait_ready_precedes_start_tunnel_within_launch_cell(nb):
     """0.d: tunnel must only start after wait_ready() succeeds. Scoped to
     the launch cell's own source so a coincidental match against inlined
