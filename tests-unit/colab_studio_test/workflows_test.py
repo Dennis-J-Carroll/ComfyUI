@@ -7,7 +7,6 @@ import asyncio
 import contextlib
 import io
 import os
-import sys
 
 import pytest
 
@@ -16,11 +15,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 @pytest.fixture(scope="module")
 def comfy(tmp_path_factory):
-    """Boot ComfyUI's node registry in CPU mode with dummy models present."""
-    sys.argv = ["main.py", "--cpu"]
-    import comfy.options
-    comfy.options.enable_args_parsing()   # MUST precede `import nodes`
+    """Boot ComfyUI's node registry in CPU mode with dummy models present.
 
+    CPU mode is guaranteed by this package's conftest.py, which forces it
+    before any test module here can `import nodes` -- regardless of what an
+    earlier-collected test package already touched. See conftest.py for why
+    that can't be done here, inside the fixture, after the fact.
+    """
     root = tmp_path_factory.mktemp("models")
     for sub, name in [
         ("checkpoints", "sd_xl_base_1.0.safetensors"),
