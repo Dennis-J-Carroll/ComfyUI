@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import time
@@ -217,3 +218,164 @@ def test_start_tunnel_clears_the_handle_when_it_times_out(tmp_path, monkeypatch)
     assert launch.start_tunnel(8188, str(log), timeout=2) is None
     assert procs[0].terminated is True
     assert launch.current_tunnel() is None
+
+
+# --------------------------------------------------------------------------
+# RuntimeSupervisor (item 0.e)
+# --------------------------------------------------------------------------
+
+SLEEPY_MAIN = "import time\ntime.sleep(30)\n"
+
+
+def _sleepy(tmp_path):
+    """A fake main.py that stays alive until stopped."""
+    (tmp_path / "main.py").write_text(SLEEPY_MAIN)
+    return str(tmp_path / "server.log")
+
+
+def test_supervisor_closes_parent_log_handle_after_start_server(tmp_path, monkeypatch):
+    """The regression guard for the fd-leak bug: start_server's own `open()`
+    handle must be closed once Popen has duplicated it for the child,
+    regardless of how the caller happens to check."""
+    log_path = _sleepy(tmp_path)
+    opened = []
+    real_open = open
+
+    def spy_open(path, *a, **kw):
+        fh = real_open(path, *a, **kw)
+        if os.fspath(path) == log_path:
+            opened.append(fh)
+        return fh
+
+    monkeypatch.setattr(launch, "open", spy_open, raising=False)
+    sup = launch.RuntimeSupervisor()
+    proc = sup.start_server(str(tmp_path), [], log_path, python=sys.executable)
+    try:
+        assert len(opened) == 1
+        assert opened[0].closed is True
+    finally:
+        sup.stop_server(timeout=10)
+        proc.wait(timeout=10)
+
+
+def test_second_start_server_returns_existing_process_without_spawning_new_one(tmp_path, monkeypatch):
+    log_path = _sleepy(tmp_path)
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def counting_popen(*a, **kw):
+        p = real_popen(*a, **kw)
+        spawned.append(p)
+        return p
+
+    monkeypatch.setattr(launch.subprocess, "Popen", counting_popen)
+    sup = launch.RuntimeSupervisor()
+    try:
+        p1 = sup.start_server(str(tmp_path), [], log_path, python=sys.executable)
+        p2 = sup.start_server(str(tmp_path), [], log_path, python=sys.executable)
+        assert p2 is p1
+        assert len(spawned) == 1
+    finally:
+        sup.stop_server(timeout=10)
+
+
+def test_stop_server_on_never_started_supervisor_returns_false_and_does_not_raise():
+    sup = launch.RuntimeSupervisor()
+    assert sup.stop_server() is False
+
+
+def test_start_stop_start_leaves_no_leaked_process(tmp_path):
+    log_path = _sleepy(tmp_path)
+    sup = launch.RuntimeSupervisor()
+
+    p1 = sup.start_server(str(tmp_path), [], log_path, python=sys.executable)
+    assert sup.stop_server(timeout=10) is True
+    p1.wait(timeout=10)
+    assert p1.poll() is not None, "first server was not actually reaped"
+
+    p2 = sup.start_server(str(tmp_path), [], log_path, python=sys.executable)
+    try:
+        assert p2 is not p1
+        assert p2.poll() is None, "second server did not start"
+    finally:
+        assert sup.stop_server(timeout=10) is True
+        p2.wait(timeout=10)
+        assert p2.poll() is not None, "second server was not actually reaped"
+
+
+def test_restart_server_stops_the_old_process_and_starts_a_new_one(tmp_path):
+    log_path = _sleepy(tmp_path)
+    sup = launch.RuntimeSupervisor()
+
+    p1 = sup.start_server(str(tmp_path), [], log_path, python=sys.executable)
+    p2 = sup.restart_server(str(tmp_path), [], log_path, python=sys.executable)
+    try:
+        assert p2 is not p1
+        p1.wait(timeout=10)
+        assert p1.poll() is not None, "old process was not stopped"
+        assert p2.poll() is None, "new process did not start"
+    finally:
+        sup.stop_server(timeout=10)
+
+
+def test_close_is_idempotent(tmp_path):
+    log_path = _sleepy(tmp_path)
+    sup = launch.RuntimeSupervisor()
+    proc = sup.start_server(str(tmp_path), [], log_path, python=sys.executable)
+    sup.close()
+    sup.close()  # must not raise the second time
+    proc.wait(timeout=10)
+    assert proc.poll() is not None
+
+
+def test_atexit_hook_is_registered(monkeypatch):
+    registered = []
+    monkeypatch.setattr(launch.atexit, "register", lambda fn: registered.append(fn))
+    sup = launch.RuntimeSupervisor()
+    assert sup.close in registered
+
+
+def test_wait_ready_delegates_to_the_given_client():
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def wait_ready(self, timeout=180.0, interval=1.0):
+            self.calls.append(timeout)
+            return True
+
+    sup = launch.RuntimeSupervisor()
+    client = FakeClient()
+    assert sup.wait_ready(timeout=5, client=client) is True
+    assert client.calls == [5]
+
+
+def test_wait_ready_builds_a_client_for_its_own_port_by_default(monkeypatch):
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, base_url):
+            seen["base_url"] = base_url
+
+        def wait_ready(self, timeout=180.0, interval=1.0):
+            seen["timeout"] = timeout
+            return False
+
+    monkeypatch.setattr(launch, "ComfyClient", FakeClient)
+    sup = launch.RuntimeSupervisor()
+    sup._port = 9999
+    assert sup.wait_ready(timeout=7) is False
+    assert seen == {"base_url": "http://127.0.0.1:9999", "timeout": 7}
+
+
+def test_module_level_start_server_still_works_and_returns_a_live_popen(tmp_path):
+    """Backward compatibility: the module-level wrapper keeps its original
+    signature and behaviour, even though it now delegates to a supervisor."""
+    log_path = _sleepy(tmp_path)
+    proc = launch.start_server(str(tmp_path), [], log_path, python=sys.executable)
+    try:
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+        launch._SUPERVISOR.stop_server(timeout=10)
