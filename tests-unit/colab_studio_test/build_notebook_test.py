@@ -194,6 +194,35 @@ def test_generate_cells_pass_the_profile_to_the_builders(nb):
     assert seen >= 4, f"expected several profile-sensitive calls, found {seen}"
 
 
+def test_generate_cells_pass_on_poll_for_vram_telemetry(nb):
+    """E3: generation must report an observed peak VRAM reading. Both
+    inline-generate cells (8 and 8b) must wire a VramProbe's sample method
+    into CLIENT.generate() via on_poll= -- without it no telemetry is ever
+    collected during the run."""
+    seen = 0
+    for title in ("8.", "8b."):
+        src = cell_titled(nb, title)
+        assert "VramProbe(CLIENT)" in src, \
+            f"cell {title} never constructs a VramProbe"
+        for m in re.finditer(r"CLIENT\.generate\(", src):
+            args = _call_args(src, m.end() - 1)
+            assert "on_poll=" in args, (
+                f"cell {title} calls CLIENT.generate() without on_poll=: "
+                f"{args!r}")
+            seen += 1
+        assert "describe(" in src, \
+            f"cell {title} never prints the VRAM summary"
+    assert seen == 2, f"expected exactly 2 CLIENT.generate() call sites, found {seen}"
+
+
+def test_vram_summary_line_states_the_sampling_qualifier(nb):
+    """Honesty requirement: the printed line must call this an *observed*
+    peak at a stated sampling interval, never present it as an exact max."""
+    for title in ("8.", "8b."):
+        src = cell_titled(nb, title)
+        assert "describe(vram_probe.summary())" in src
+
+
 def test_disk_guard_measures_the_models_destination(nb):
     """PERSIST=everything symlinks models/ to Drive, so /content's free space
     is the wrong filesystem to hand recommend()."""
