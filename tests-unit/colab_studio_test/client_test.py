@@ -1,12 +1,14 @@
-"""Tests ComfyClient against a real stub HTTP server on a loopback socket."""
+"""Tests ComfyClient against a real stub HTTP server on a loopback socket.
+
+The stub server itself (Handler, STATE, and the `server` fixture) lives in
+conftest.py, shared with telemetry_test.py -- see the comment there.
+"""
 import contextlib
 import copy
 import io
 import json
 import sys
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
@@ -27,105 +29,6 @@ def comfy_execution():
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         import execution
     return execution
-
-STATE = {"ready": True, "history_hits": 0, "history_ready_after": 0,
-         "history_error": False}
-
-# What ComfyUI actually puts in /history when a node blows up at runtime:
-# outputs stays empty forever, so only `status` reveals the failure.
-ERROR_HISTORY = {
-    "outputs": {},
-    "status": {
-        "status_str": "error",
-        "completed": False,
-        "messages": [
-            ["execution_start", {"prompt_id": "pid-123"}],
-            ["execution_error", {
-                "node_id": "5",
-                "node_type": "KSampler",
-                "exception_type": "torch.cuda.OutOfMemoryError",
-                "exception_message": "CUDA out of memory. Tried to allocate 2 GiB",
-            }],
-        ],
-    },
-}
-
-# In-flight: completed is False but status_str is not "error". Treating this
-# as a failure would abort every generate on the first poll.
-RUNNING_HISTORY = {
-    "outputs": {},
-    "status": {"status_str": "success", "completed": False, "messages": []},
-}
-
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        pass
-
-    def _json(self, code, payload):
-        body = json.dumps(payload).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        if self.path.startswith("/system_stats"):
-            if not STATE["ready"]:
-                self._json(503, {"error": "booting"})
-            else:
-                self._json(200, {"system": {"comfyui_version": "0.10.0"}})
-        elif self.path.startswith("/history/"):
-            STATE["history_hits"] += 1
-            pid = self.path.rsplit("/", 1)[-1]
-            if STATE["history_error"]:
-                self._json(200, {pid: ERROR_HISTORY})
-            elif STATE["history_hits"] <= STATE["history_ready_after"]:
-                self._json(200, {pid: RUNNING_HISTORY})
-            else:
-                self._json(200, {pid: {"outputs": {"7": {"images": [
-                    {"filename": "out_001.png", "subfolder": "colab", "type": "output"}
-                ]}}, "status": {"status_str": "success", "completed": True,
-                                "messages": []}}})
-        elif self.path.startswith("/view"):
-            self.send_response(200)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", "4")
-            self.end_headers()
-            self.wfile.write(b"PNG!")
-        else:
-            self._json(404, {})
-
-    def do_POST(self):
-        n = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(n)
-        if self.path == "/prompt":
-            body = json.loads(raw)
-            if "prompt" not in body:
-                self._json(400, {"error": "no_prompt", "node_errors": {}})
-            elif body["prompt"].get("bad"):
-                self._json(400, {"error": {"message": "bad graph"},
-                                 "node_errors": {"5": "nope"}})
-            else:
-                self._json(200, {"prompt_id": "pid-123", "number": 1,
-                                 "node_errors": {}})
-        elif self.path == "/upload/image":
-            self._json(200, {"name": "uploaded.png", "subfolder": "",
-                             "type": "input"})
-        else:
-            self._json(404, {})
-
-
-@pytest.fixture
-def server():
-    STATE.update({"ready": True, "history_hits": 0, "history_ready_after": 0,
-                  "history_error": False})
-    httpd = HTTPServer(("127.0.0.1", 0), Handler)
-    t = threading.Thread(target=httpd.serve_forever, daemon=True)
-    t.start()
-    yield f"http://127.0.0.1:{httpd.server_address[1]}", STATE
-    httpd.shutdown()
 
 
 def test_wait_ready_true_when_server_answers(server):
@@ -199,7 +102,7 @@ def test_generate_surfaces_execution_errors(server):
 def test_error_parser_matches_comfyui_own_execution_status(comfy_execution):
     """Binds _execution_error to ComfyUI's real type, not to our stub.
 
-    ERROR_HISTORY above is hand-written; if it drifted from what the server
+    conftest.py's ERROR_HISTORY is hand-written; if it drifted from what the server
     actually sends, every error test would still pass while the fix silently
     never fired. This builds a genuine PromptQueue.ExecutionStatus, mirrors
     what execution.py's task_done() stores (_asdict into the history entry),
@@ -272,3 +175,55 @@ def test_generate_end_to_end_returns_image_bytes(server):
     url, _ = server
     out = ComfyClient(url).generate({"1": {"class_type": "X", "inputs": {}}}, timeout=10)
     assert out == [b"PNG!"]
+
+
+# --- E3: system_stats() and the on_poll telemetry hook -------------------
+
+def test_system_stats_returns_parsed_body(server):
+    url, _ = server
+    stats = ComfyClient(url).system_stats()
+    assert stats["system"]["comfyui_version"] == "0.10.0"
+    assert stats["devices"][0]["name"] == "NVIDIA A100-SXM4-40GB"
+
+
+def test_system_stats_raises_comfyerror_on_non_200(server):
+    url, state = server
+    state["ready"] = False
+    with pytest.raises(ComfyError):
+        ComfyClient(url).system_stats()
+
+
+def test_on_poll_is_invoked_once_per_poll_iteration(server):
+    """wait_result's poll loop is the natural sampling point -- on_poll must
+    fire exactly once per pass through it, not once total or once per
+    history hit of some other multiple."""
+    url, state = server
+    state["history_ready_after"] = 3
+    calls = []
+    ComfyClient(url).wait_result("pid-123", timeout=10, on_poll=lambda: calls.append(1))
+    assert len(calls) == state["history_hits"]
+    assert len(calls) >= 3
+
+
+def test_on_poll_raising_does_not_abort_generation(server):
+    """A telemetry failure must never be able to kill a render. wait_result
+    must swallow an on_poll exception and keep polling until real outputs
+    appear."""
+    url, state = server
+    state["history_ready_after"] = 2
+
+    def boom():
+        raise RuntimeError("telemetry backend exploded")
+
+    refs = ComfyClient(url).wait_result("pid-123", timeout=10, on_poll=boom)
+    assert refs[0]["filename"] == "out_001.png"
+
+
+def test_generate_threads_on_poll_through_to_wait_result(server):
+    url, _ = server
+    calls = []
+    out = ComfyClient(url).generate(
+        {"1": {"class_type": "X", "inputs": {}}}, timeout=10,
+        on_poll=lambda: calls.append(1))
+    assert out == [b"PNG!"]
+    assert calls, "generate(on_poll=...) never reached wait_result's loop"
