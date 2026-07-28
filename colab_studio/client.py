@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from typing import Callable
 
 import requests
 
@@ -67,6 +68,18 @@ class ComfyClient:
             time.sleep(interval)
         return False
 
+    def system_stats(self) -> dict:
+        """GET /system_stats -- the server's own device inventory and memory
+        counters (server.py's system_stats handler; devices[0] is the
+        primary device). This is the only window into VRAM used by the
+        diffusion model, which runs in this server's process, not the
+        notebook kernel -- see colab_studio.telemetry for how it is turned
+        into an (honestly qualified) observed-peak reading."""
+        r = requests.get(f"{self.base_url}/system_stats", timeout=10)
+        if r.status_code != 200:
+            raise ComfyError(f"system_stats failed ({r.status_code}): {r.text[:300]}")
+        return r.json()
+
     def upload_image(self, path: str) -> str:
         """Upload to the server's input/ dir. Returns the name to put in
         LoadImage.inputs.image."""
@@ -99,7 +112,8 @@ class ComfyClient:
         return r.json()["prompt_id"]
 
     def wait_result(self, prompt_id: str, timeout: float = 600.0,
-                    interval: float = 1.0) -> list[dict]:
+                    interval: float = 1.0,
+                    on_poll: Callable[[], None] | None = None) -> list[dict]:
         """Poll /history until outputs appear. Returns image refs.
 
         Raises ComfyError as soon as the server reports an execution failure.
@@ -107,9 +121,20 @@ class ComfyClient:
         failures (OOM, tensor mismatch) only ever show up here -- and they
         leave `outputs` empty forever, so ignoring `status` means a silent
         full-timeout hang ending in a diagnostic-free TimeoutError.
+
+        `on_poll`, when given, is called once per pass through this loop --
+        the natural point to sample telemetry (see
+        colab_studio.telemetry.VramProbe) at the same cadence as `interval`.
+        Its exceptions are swallowed: a telemetry failure must never be able
+        to abort a render that may otherwise run for many minutes.
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if on_poll is not None:
+                try:
+                    on_poll()
+                except Exception:
+                    pass
             r = requests.get(f"{self.base_url}/history/{prompt_id}", timeout=15)
             if r.status_code == 200:
                 hist = r.json().get(prompt_id)
@@ -139,7 +164,13 @@ class ComfyClient:
             raise ComfyError(f"view failed ({r.status_code})")
         return r.content
 
-    def generate(self, graph: dict, timeout: float = 600.0) -> list[bytes]:
-        """submit -> wait -> fetch. The whole inline-cell path in one call."""
+    def generate(self, graph: dict, timeout: float = 600.0,
+                on_poll: Callable[[], None] | None = None) -> list[bytes]:
+        """submit -> wait -> fetch. The whole inline-cell path in one call.
+
+        `on_poll` is threaded straight through to wait_result() -- pass
+        VramProbe.sample for VRAM telemetry sampled once per poll.
+        """
         pid = self.submit(graph)
-        return [self.fetch_image(ref) for ref in self.wait_result(pid, timeout)]
+        return [self.fetch_image(ref)
+                for ref in self.wait_result(pid, timeout, on_poll=on_poll)]

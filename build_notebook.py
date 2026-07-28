@@ -17,7 +17,7 @@ import os
 from colab_studio import compat
 
 MODULES = ["compat.py", "registry.py", "advice.py", "workflows.py",
-           "fetch.py", "client.py", "launch.py"]
+           "fetch.py", "client.py", "telemetry.py", "launch.py"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -317,6 +317,7 @@ else:
 #@title 8. Generate an image here (no tunnel needed)
 from IPython.display import Image, display
 from colab_studio import workflows
+from colab_studio.telemetry import VramProbe, describe
 
 prompt = "a lighthouse in a storm, dramatic light"  #@param {type:"string"}
 negative = "blurry, watermark, text"  #@param {type:"string"}
@@ -342,11 +343,16 @@ else:
 if PROFILE.startswith("flux") and cfg != 1.0:
     print(f"note: Flux ignores cfg; using 1.0 with FluxGuidance, not {cfg}.")
 
-for i, data in enumerate(CLIENT.generate(graph)):
+# VRAM telemetry: sampled from GET /system_stats once per wait_result() poll
+# (1s by default) -- an OBSERVED PEAK, not a true maximum. See
+# colab_studio/telemetry.py for why a spike between polls is invisible to it.
+vram_probe = VramProbe(CLIENT)
+for i, data in enumerate(CLIENT.generate(graph, on_poll=vram_probe.sample)):
     path = f"/content/gen_{i}.png"
     with open(path, "wb") as fh:
         fh.write(data)
     display(Image(filename=path))
+print(describe(vram_probe.summary()))
 """),
 
         _code("""
@@ -371,6 +377,7 @@ else:
     import requests
     from IPython.display import Image, display
     from colab_studio import workflows
+    from colab_studio.telemetry import VramProbe, describe
 
     local = "/content/source_image.png"
     if source == "upload":
@@ -391,11 +398,15 @@ else:
         graph = workflows.img2img(CKPT, prompt2, image=server_name,
                                   denoise=denoise, profile=PROFILE)
 
-    for i, data in enumerate(CLIENT.generate(graph)):
+    # See cell 8: VRAM telemetry is an OBSERVED PEAK sampled once per poll,
+    # not a true maximum.
+    vram_probe = VramProbe(CLIENT)
+    for i, data in enumerate(CLIENT.generate(graph, on_poll=vram_probe.sample)):
         path = f"/content/edit_{i}.png"
         with open(path, "wb") as fh:
             fh.write(data)
         display(Image(filename=path))
+    print(describe(vram_probe.summary()))
 """),
 
         _code("""
