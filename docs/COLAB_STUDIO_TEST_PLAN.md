@@ -3,16 +3,16 @@
 **For:** you, running on real Colab hardware
 **Artifact under test:** `ComfyUI_Colab_Studio.ipynb`
 **Branch:** PR #1 (`feat/colab-studio`) is **MERGED** into `master`
-(merge commit `6f572b1c`). Phase 0 hardening below (ComfyUI revision pin,
-opt-in tunnel, RuntimeSupervisor lifecycle) is in flight on
-`chore/colab-studio-truth-repro`, not yet merged as of this revision of
-this document.
+(merge commit `6f572b1c`). Phase 0 hardening (ComfyUI revision pin,
+opt-in tunnel, RuntimeSupervisor lifecycle) is **also merged** via PR #2.
+VRAM telemetry is open in PR #3 — merge it before running, or `#@title 8`
+will not print the peak-VRAM line.
 
 ---
 
 ## Read this first: what is and isn't proven
 
-**Verified on this machine — 116 automated tests
+**Verified on this machine — 132 automated tests
 (`tests-unit/colab_studio_test/`, computed by running the suite, not
 copied from an earlier count), ruff clean:**
 
@@ -26,14 +26,14 @@ copied from an earlier count), ruff clean:**
 | Notebook independence | No `mcp`, no `uv`/`uvx`, no developer paths, no clone of this repo. |
 | **E5** — fetch → launch → readiness → generate, end to end | Executed against a real ComfyUI server on CPU (SD1.5, 384×384, 8 steps): 1 image in 145 s. `start_server` returned in 0.00 s against a real server, not a stub. Does **not** touch E1–E4 below — those remain GPU- and model-specific. Full record: `docs/superpowers/specs/2026-07-25-comfyui-colab-studio-design.md` §E5. |
 
-**NOT verified — nobody has run a single node on a GPU. This is what you're testing.**
+**Still open. E2 is the last untested code path in the image pipeline** — see `docs/E2_CONTROLNET_TEST_RUN.md` for a step-by-step.
 
 | ID | Claim | Status |
 |---|---|---|
-| **E1** | Flux fp8 all-in-one loads via `CheckpointLoaderSimple` | Inferred from file layout + 16.06 GB size. Never executed on GPU. |
+| ~~**E1**~~ | Flux fp8 all-in-one loads via `CheckpointLoaderSimple` | ✅ **CLOSED** — A100, 2026-07-27. 1024×1024 in 13.85 s, ~1.91 it/s. |
 | **E2** | Diffusers ControlNet converts at runtime (`comfy/controlnet.py:623`) | Read from source. Never executed. |
-| **E3** | VRAM headroom per model on real hardware | Unmeasured. |
-| **E4** | The VRAM→profile→flags thresholds (12.0 / 20.0 GB) | Implemented and boundary-unit-tested. **Never calibrated against a real GPU.** |
+| **E3** | VRAM headroom per model on real hardware | Partial — Flux ran without OOM on a 40 GB A100, but the *margin* was never measured. PR #3 adds the measurement; this run captures it. |
+| **E4** | The VRAM→profile→flags thresholds (12.0 / 20.0 GB) | High tier ✅ confirmed on A100. **Low (<12 GB) and mid (12–20 GB) still uncalibrated** — no T4 or L4 run. The T4 case matters most: `--highvram` there causes OOM. |
 
 If something below fails, that's the test doing its job. Record it rather than working around it.
 
@@ -116,7 +116,9 @@ Cell 2 prints your GPU, VRAM and free disk.
 | VRAM (GB) | |
 | Free disk (GB) | |
 
-**Then run cell 11 (`5. Choose profile and download models`) — but read its first six printed lines and be ready to interrupt (⏹) before the download starts if the profile looks wrong.**
+> **Cell numbering.** Colab's cell indices and the `#@title` numbers do **not** match — eight `%%writefile` library cells sit between "4." and "5.". Always go by the `#@title` label. Current mapping: `1`→idx 1, `2`→2, `3`→3, `4`→4, library→5–12, `5`→**13**, `6`→14, `7`→**15**, `8`→**16**, `8b`→**17**, `9`→18, `10`→**19**. This shifts whenever a library module is added, which is why the `#@title` numbers are the stable reference.
+
+**Then run `#@title 5` (`Choose profile and download models`, index 13) — but read its first six printed lines and be ready to interrupt (⏹) before the download starts if the profile looks wrong.**
 
 | What it printed | Your value |
 |---|---|
@@ -139,9 +141,9 @@ Compare against the thresholds I implemented (`<12 GB` = low, `12–20` = mid, `
 
 ## Phase 2 — Install and first image (20–30 min, mostly download wait)
 
-Run cells 3 → 14 in order. Cells 5–10 write library files and complete instantly.
+Run `#@title 3` → `#@title 8` in order (indices 3–16). The eight library cells (indices 5–12) write files and finish instantly.
 
-Cell 11 downloads models — SDXL is ~6.8 GB, Flux ~16.1 GB. This is the slow part.
+`#@title 5` downloads models — SDXL is ~6.8 GB, Flux ~16.1 GB. This is the slow part.
 
 ### Checkpoints along the way
 
@@ -153,12 +155,12 @@ Cell 11 downloads models — SDXL is ~6.8 GB, Flux ~16.1 GB. This is the slow pa
 | 12. Workflows | `API workflows written to /content/wf_api: …` | |
 | 13. Launch | `waiting for server...` then `ComfyUI ready. Public URL: https://….trycloudflare.com` | See Phase 5 |
 
-### 🔴 The critical structural test — cell 13
+### 🔴 The critical structural test — `#@title 7` (index 15)
 
-**The whole point of this rewrite is that cell 13 finishes and returns control.** The old notebook's launch cell ran forever, making everything below it unreachable.
+**The whole point of this rewrite is that `#@title 7` finishes and returns control.** The old notebook's launch cell ran forever, making everything below it unreachable.
 
-- ✅ **PASS:** cell 13 shows a completed execution counter and prints a URL. Cells 14+ are runnable.
-- ❌ **FAIL:** cell 13 spins indefinitely. That's the original bug back — stop and tell me.
+- ✅ **PASS:** `#@title 7` shows a completed execution counter and returns. Every cell below it is runnable.
+- ❌ **FAIL:** `#@title 7` spins indefinitely. That's the original bug back — stop and tell me.
 
 **Open the tunnel URL.** It should load the ComfyUI graph UI, not a 502. A 502 means the tunnel started before the server was ready — the ordering fix failed.
 
@@ -169,7 +171,7 @@ Defaults are fine. Run it.
 - ✅ **PASS:** an image renders **inline in the notebook**. You never touched the tunnel.
 - ❌ **FAIL:** record the exact error.
 
-**This validates E1 if `profile=flux-dev`** — the 16 GB all-in-one actually loading through `CheckpointLoaderSimple` is the single biggest untested assumption in the build. If you're on SDXL, E1 stays unverified; to test it, set `IMAGE_MODEL="flux-dev"` in cell 1 and rerun from cell 11.
+**This validates E1 if `profile=flux-dev`** — the 16 GB all-in-one actually loading through `CheckpointLoaderSimple` is the single biggest untested assumption in the build. If you're on SDXL, E1 stays unverified; to test it, set `IMAGE_MODEL="flux-dev"` in cell 1 and rerun from `#@title 5`.
 
 ### 📋 Record
 
@@ -180,13 +182,13 @@ Defaults are fine. Run it.
 | Cell 14 produced an inline image | ☐ yes ☐ no |
 | Seconds per image | |
 | **E1** — Flux loaded via CheckpointLoaderSimple | ☐ pass ☐ fail ☐ not tested (SDXL) |
-| Peak VRAM (cell 17 → `free VRAM`, or `!nvidia-smi`) | **E3:** |
+| Observed peak VRAM (printed by `#@title 8` itself) | **E3:** |
 
 ---
 
 ## Phase 3 — img2img and the upload path (10 min)
 
-Run **cell 15** (`8b. Image-to-image / ControlNet`). **Tick `run_this` first** — it defaults off so that *Run all* is not stalled by the file picker, and the cell just prints a skip message until you tick it. Then leave `source="upload"`, `mode="img2img"`. Pick any image.
+Run **`#@title 8b`** (index 17). **Tick `run_this` first** — it defaults off so that *Run all* is not stalled by the file picker, and the cell just prints a skip message until you tick it. Then leave `source="upload"`, `mode="img2img"`. Pick any image.
 
 This exercises the one piece the tunnel UI would otherwise handle for you: `POST /upload/image` → the returned `name` feeding a `LoadImage` node.
 
@@ -199,7 +201,7 @@ Also try `source="url"` with any direct image URL.
 
 ## Phase 4 — ControlNet (optional, +2.33 GB) — this is E2
 
-Only if you want ControlNet, and only on an **SDXL** profile — on Flux, cell 11 disables it by design. **Set `CONTROLNET=True` in cell 1, rerun cell 11** (downloads 2.33 GB), then cell 15 with `run_this` ticked and `mode="controlnet"`.
+Only if you want ControlNet, and only on an **SDXL** profile — on Flux, `#@title 5` disables it by design. **Set `CONTROLNET=True` in cell 1, rerun `#@title 5`** (downloads 2.33 GB), then `#@title 8b` with `run_this` ticked and `mode="controlnet"`.
 
 **This is the E2 test, and the riskiest download in the project.** The file is diffusers-layout (`diffusion_pytorch_model.fp16.safetensors`, renamed on the way down). I read `comfy/controlnet.py:623` and found an explicit diffusers branch, so it *should* convert — but nobody has run it. A 2.33 GB download that fails to load is the worst failure mode here.
 
@@ -213,7 +215,7 @@ Only if you want ControlNet, and only on an **SDXL** profile — on Flux, cell 1
 
 ## Phase 5 — Ops cells and failure recovery (5 min)
 
-These exist because cell 13 no longer blocks. Verify each is reachable:
+These exist because `#@title 7` no longer blocks. Verify each is reachable:
 
 | Cell | Action | Expect |
 |---|---|---|
@@ -226,8 +228,8 @@ These exist because cell 13 no longer blocks. Verify each is reachable:
 
 **Deliberately break it — two failure paths worth exercising, because both were bugs the review caught:**
 
-1. **Restart race.** Run `restart server`, then immediately run cell 14 before boot finishes. It should wait, or raise a clear `ComfyError` — not hang, not mislead.
-2. **Execution error surfaces fast.** Force an OOM: set `width=height=2048` in cell 14 on a small GPU. You should get a **`ComfyError` naming the failing node within seconds**. If instead it sits silent for ten minutes and then raises a bare `TimeoutError`, that's the pre-fix behaviour and a regression — `wait_result` is supposed to read the history `status` field now.
+1. **Restart race.** Run `restart server`, then immediately run `#@title 8` before boot finishes. It should wait, or raise a clear `ComfyError` — not hang, not mislead.
+2. **Execution error surfaces fast.** Force an OOM: set `width=height=2048` in `#@title 8` on a small GPU. You should get a **`ComfyError` naming the failing node within seconds**. If instead it sits silent for ten minutes and then raises a bare `TimeoutError`, that's the pre-fix behaviour and a regression — `wait_result` is supposed to read the history `status` field now.
 3. **Re-tunnel doesn't leak.** Run `re-tunnel` twice. Each run should print a fresh URL and the previous tunnel should be stopped, not left running. If old `trycloudflare.com` URLs keep working after a re-tunnel, the previous process was orphaned.
 
 ---
@@ -273,7 +275,7 @@ STRUCTURAL  (the things this rewrite exists to fix)
   Cell 13 returned control, did not block ........ pass / fail
   Tunnel URL loaded, no 502 ...................... pass / fail
   Cell 14 rendered an image inline ............... pass / fail
-  Run all reached cell 17 without stalling ....... pass / fail
+  Run all reached the ops cell without stalling ..... pass / fail
   Cells 16/17 reachable and rerunnable ........... pass / fail
 
 EXECUTION CRITERIA
@@ -298,7 +300,7 @@ Paste the scorecard plus, for anything that failed:
 2. The full traceback
 3. Cell 16's log output
 
-The three things I most want, in order: **the E4 calibration numbers from Phase 1** (cheapest, and the thresholds are currently guesses), **whether cell 13 returned control** (the whole architecture rests on it), and **the E2 ControlNet traceback if it fails** (the riskiest untested path).
+The three things I most want, in order: **the E4 calibration numbers from Phase 1** (cheapest, and the thresholds are currently guesses), **whether `#@title 7` returned control** (the whole architecture rests on it), and **the E2 ControlNet traceback if it fails** (the riskiest untested path).
 
 ---
 
